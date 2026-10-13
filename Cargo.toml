@@ -27,6 +27,7 @@ http = "1"
 http-body = "1"
 tonic = { version = "0.12", features = ["gzip"] }
 tonic-health = "0.12"
+tonic-reflection = "0.12"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 thiserror = "2"
@@ -34,6 +35,8 @@ thiserror = "2"
 [dev-dependencies]
 hyper = "1"
 http-body-util = "0.1"
+prost = "0.13"
+prost-types = "0.13"
 
 [profile.release]
 strip = true

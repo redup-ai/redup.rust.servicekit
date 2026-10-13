@@ -29,6 +29,7 @@ pub mod http;
 pub mod logging;
 pub mod metrics;
 pub mod monitor;
+pub mod reflection;
 
 pub use config::{Config, MonitorServerConfig, ServiceInfoEntry};
 pub use monitor::{ReadyProbe, ServiceKit, TaskStatus, TaskTracker};
