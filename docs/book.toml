@@ -1,0 +1,14 @@
+[book]
+title = "redup-servicekit"
+authors = ["REDUP"]
+description = "Rust toolkit for microservices: config, JSON logging, Prometheus metrics, gRPC utilities"
+language = "en"
+src = "source"
+
+[build]
+build-dir = "../../public"
+
+[output.html]
+git-repository-url = "https://github.com/redup-ai/redup.rust.servicekit"
+default-theme = "light"
+preferred-dark-theme = "dark"
