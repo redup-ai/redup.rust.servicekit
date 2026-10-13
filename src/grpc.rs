@@ -71,8 +71,8 @@ where
         let mut inner = self.inner.clone();
 
         let start = std::time::Instant::now();
-        kit.inc_stat(&format!("request___method__{method}"), 1.0);
         kit.init_method(&method);
+        kit.inc_stat(&format!("request___method__{method}"), 1.0);
         let task_id = kit.task_tracker().start();
 
         let future = async move {
@@ -165,6 +165,42 @@ mod tests {
         assert!(text.contains("stats_processed{"));
         assert!(text.contains("started_total"));
         assert!(text.contains("completed_total"));
+        // Counter must grow on each call, not be reset by init_method.
+        let bytes = kit.metrics_text();
+        let text = String::from_utf8_lossy(&bytes);
+        let line = text
+            .lines()
+            .find(|l| l.starts_with("stats_request") && l.contains("method=\"CreateUser\""))
+            .expect("stats_request for CreateUser");
+        assert!(
+            line.ends_with(" 1"),
+            "stats_request must be 1 after one call, got: {line}"
+        );
+    }
+
+    #[tokio::test]
+    async fn layer_request_counter_accumulates() {
+        let kit = ServiceKit::new(MonitorServerConfig::default(), 4, Some(2));
+        let layer = GrpcMetricsLayer::new(kit.clone());
+        for _ in 0..3 {
+            let mut svc = layer.layer(EchoService);
+            let request = HttpRequest::builder()
+                .method(Method::POST)
+                .uri(Uri::from_static("/doaid.users.v1.UsersService/CreateUser"))
+                .body(empty_body())
+                .unwrap();
+            let _ = svc.call(request).await;
+        }
+        let bytes = kit.metrics_text();
+        let text = String::from_utf8_lossy(&bytes);
+        let line = text
+            .lines()
+            .find(|l| l.starts_with("stats_request") && l.contains("method=\"CreateUser\""))
+            .expect("stats_request for CreateUser");
+        assert!(
+            line.ends_with(" 3"),
+            "stats_request must accumulate to 3, got: {line}"
+        );
     }
 
     #[derive(Clone)]
