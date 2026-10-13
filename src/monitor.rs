@@ -84,6 +84,12 @@ impl StatsStore {
         stats.counters.insert(key.to_string(), value);
     }
 
+    /// Insert a stat unless the key already exists (idempotent init).
+    fn ensure(&self, key: &str, value: f64) {
+        let mut stats = self.inner.lock().unwrap();
+        stats.counters.entry(key.to_string()).or_insert(value);
+    }
+
     fn observe(&self, key: &str, value: f64) {
         let mut stats = self.inner.lock().unwrap();
         // Split borrows: take maps out to avoid double mutable borrow.
@@ -332,20 +338,25 @@ impl ServiceKit {
         self.store.set(key, value);
     }
 
+    /// Initialize a stat counter only if it does not exist yet.
+    pub fn ensure_stat(&self, key: &str, value: f64) {
+        self.store.ensure(key, value);
+    }
+
     /// Pre-register per-method stats (analog of `grpc_init_wrapper`):
     /// `request___method__M`, `processed___method__M___status__success|failure`,
     /// `errors___method__M___type__other`.
     pub fn init_method(&self, method: &str) {
-        self.set_stat(&format!("request___method__{method}"), 0.0);
-        self.set_stat(
+        self.ensure_stat(&format!("request___method__{method}"), 0.0);
+        self.ensure_stat(
             &format!("processed___method__{method}___status__success"),
             0.0,
         );
-        self.set_stat(
+        self.ensure_stat(
             &format!("processed___method__{method}___status__failure"),
             0.0,
         );
-        self.set_stat(&format!("errors___method__{method}___type__other"), 0.0);
+        self.ensure_stat(&format!("errors___method__{method}___type__other"), 0.0);
     }
 
     /// Observe a metric value: updates EMA long/short and, for keys with
