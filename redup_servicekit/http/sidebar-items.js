@@ -1,1 +1,1 @@
-window.SIDEBAR_ITEMS = {"fn":["router"],"struct":["HttpState"]};
+window.SIDEBAR_ITEMS = {"fn":["http_method_name","router"],"struct":["HttpMetricsLayer","HttpMetricsService","HttpState"]};
