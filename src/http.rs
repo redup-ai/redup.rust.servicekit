@@ -92,6 +92,42 @@ impl<S> Layer<S> for HttpMetricsLayer {
     }
 }
 
+/// RAII guard for the in-flight HTTP task metric.
+///
+/// `HttpMetricsService::call` must finish the tracked task exactly once per
+/// request. A regular completion calls [`finish`](Self::finish) (records the
+/// duration); if the handler future is dropped mid-flight — client gone,
+/// proxy reset, timeout at the edge — the guard's `Drop` discards the task
+/// so `tasks_count` / `current_tasks_max_time_spend` cannot grow forever.
+struct TaskGuard {
+    kit: Arc<ServiceKit>,
+    id: Option<String>,
+}
+
+impl TaskGuard {
+    fn start(kit: &Arc<ServiceKit>) -> Self {
+        let id = kit.task_tracker().start();
+        Self {
+            kit: kit.clone(),
+            id: Some(id),
+        }
+    }
+
+    fn finish(&mut self) {
+        if let Some(id) = self.id.take() {
+            self.kit.task_tracker().finish(&id);
+        }
+    }
+}
+
+impl Drop for TaskGuard {
+    fn drop(&mut self) {
+        if let Some(id) = self.id.take() {
+            self.kit.task_tracker().discard(&id);
+        }
+    }
+}
+
 /// Service wrapper produced by [`HttpMetricsLayer`].
 #[derive(Clone)]
 pub struct HttpMetricsService<S> {
@@ -122,12 +158,12 @@ where
         let start = std::time::Instant::now();
         kit.init_method(&method);
         kit.inc_stat(&format!("request___method__{method}"), 1.0);
-        let task_id = kit.task_tracker().start();
+        let mut guard = TaskGuard::start(&kit);
 
         let future = async move {
             let result = inner.call(req).await;
             let elapsed = start.elapsed().as_secs_f64();
-            kit.task_tracker().finish(&task_id);
+            guard.finish();
 
             match result {
                 Ok(response) => {
@@ -261,6 +297,57 @@ mod tests {
         assert!(text.contains("stats_tasks_with_current_time_spend_normalised_total"));
         assert!(text.contains("tasks_time_spent_quantile_bucket"));
         assert!(text.contains("service_threads"));
+    }
+
+    /// A service whose handler never resolves (client gone / proxy reset
+    /// mid-request). Dropping the request future must not leave the task in
+    /// the tracker: previously `tasks_count` grew forever and
+    /// `current_tasks_max_time_spend` accumulated (`HttpMetricsService`
+    /// called `finish` only after `inner.call(req).await`).
+    #[derive(Clone)]
+    struct NeverService;
+
+    impl Service<Request<axum::body::Body>> for NeverService {
+        type Response = Response<axum::body::Body>;
+        type Error = std::convert::Infallible;
+        type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+
+        fn poll_ready(&mut self, _: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn call(&mut self, _: Request<axum::body::Body>) -> Self::Future {
+            Box::pin(std::future::pending())
+        }
+    }
+
+    #[tokio::test]
+    async fn dropped_request_does_not_leak_task() {
+        let kit = ServiceKit::new(MonitorServerConfig::default(), 4, Some(2));
+        let mut svc = HttpMetricsLayer::new(kit.clone()).layer(NeverService);
+
+        let req = Request::builder()
+            .uri("/api/v1/chat/tasks/:id/transcript")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let fut = svc.call(req);
+        assert_eq!(kit.task_tracker().in_flight(), 1);
+        drop(fut);
+        assert_eq!(kit.task_tracker().in_flight(), 0);
+
+        // A normal completion must not double-count or under-count.
+        let ready = Arc::new(AtomicBool::new(true));
+        kit.set_ready_probe(ready);
+        let app = router(kit.clone()).layer(HttpMetricsLayer::new(kit.clone()));
+        app.oneshot(
+            Request::builder()
+                .uri("/livez")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(kit.task_tracker().in_flight(), 0);
     }
 
     #[test]
