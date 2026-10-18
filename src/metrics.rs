@@ -123,6 +123,33 @@ pub fn sanitize_metric_name(name: &str) -> String {
         .to_lowercase()
 }
 
+/// Sanitize a Prometheus label name so `GaugeVec::new`/`CounterVec::new` can
+/// never panic on user-derived labels (e.g. an empty gRPC method name after
+/// `grpc_method_name("/")`). Prometheus label names must match
+/// `[a-zA-Z_][a-zA-Z0-9_]*`; invalid characters are replaced with `_` and an
+/// empty result falls back to `unknown`.
+pub fn sanitize_label_name(name: &str) -> String {
+    let mut out = String::with_capacity(name.len().max(1));
+    for (i, b) in name.bytes().enumerate() {
+        let ok = if i == 0 {
+            b.is_ascii_alphabetic() || b == b'_'
+        } else {
+            b.is_ascii_alphanumeric() || b == b'_'
+        };
+        out.push(if ok {
+            b as char
+        } else {
+            '_'
+        });
+    }
+    if out.is_empty() {
+        out.push_str("unknown");
+    } else if !(out.as_bytes()[0] == b'_' || out.as_bytes()[0].is_ascii_alphabetic()) {
+        out.insert(0, '_');
+    }
+    out
+}
+
 /// Split a Python-style stat key `name___label__value___label2__value2`.
 /// The first part is the metric name; the remaining parts are `label__value` pairs.
 pub fn parse_stat_key(key: &str) -> (String, Vec<(String, String)>) {
@@ -130,7 +157,10 @@ pub fn parse_stat_key(key: &str) -> (String, Vec<(String, String)>) {
     let mut labels = Vec::new();
     for label_part in rest.split("___").filter(|s| !s.is_empty()) {
         if let Some((label_name, label_value)) = label_part.split_once("__") {
-            labels.push((label_name.to_string(), label_value.to_string()));
+            labels.push((
+                sanitize_label_name(label_name),
+                label_value.to_string(),
+            ));
         }
     }
     (name.to_string(), labels)
@@ -140,7 +170,7 @@ pub fn parse_stat_key(key: &str) -> (String, Vec<(String, String)>) {
 pub fn label_names(extra: &[&str]) -> Vec<String> {
     let mut names = Vec::with_capacity(extra.len() + 1);
     names.push("inittime".to_string());
-    names.extend(extra.iter().map(|s| s.to_string()));
+    names.extend(extra.iter().map(|s| sanitize_label_name(s)));
     names
 }
 
@@ -203,7 +233,10 @@ impl MetricsRegistry {
 
     /// Get or create a `CounterVec` (counter with `inittime` label).
     pub fn counter_vec(&self, name: &str, help: &str, extra_labels: &[&str]) -> CounterVec {
-        let mut cache = self.counter_vecs.lock().unwrap();
+        let mut cache = self
+            .counter_vecs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         if let Some(c) = cache.get(name) {
             return c.clone();
         }
@@ -220,7 +253,10 @@ impl MetricsRegistry {
 
     /// Get or create a `GaugeVec` (gauge with `inittime` label).
     pub fn gauge_vec(&self, name: &str, help: &str, extra_labels: &[&str]) -> GaugeVec {
-        let mut cache = self.gauge_vecs.lock().unwrap();
+        let mut cache = self
+            .gauge_vecs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         if let Some(g) = cache.get(name) {
             return g.clone();
         }
@@ -243,7 +279,10 @@ impl MetricsRegistry {
         extra_labels: &[&str],
         bucket_type: BucketType,
     ) -> HistogramVec {
-        let mut cache = self.histogram_vecs.lock().unwrap();
+        let mut cache = self
+            .histogram_vecs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         if let Some(h) = cache.get(name) {
             return h.clone();
         }
@@ -274,14 +313,20 @@ impl MetricsRegistry {
 
     /// Gauge value getter for the `inittime`-only series (used by refresh).
     pub fn gauge_value(&self, name: &str) -> Option<f64> {
-        let cache = self.gauge_vecs.lock().unwrap();
+        let cache = self
+            .gauge_vecs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let vec = cache.get(name)?;
         Some(vec.with_label_values(&[self.inittime.as_str()]).get())
     }
 
     /// Counter value getter for the `inittime`-only series (used by refresh).
     pub fn counter_value(&self, name: &str) -> Option<f64> {
-        let cache = self.counter_vecs.lock().unwrap();
+        let cache = self
+            .counter_vecs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let vec = cache.get(name)?;
         Some(vec.with_label_values(&[self.inittime.as_str()]).get())
     }
@@ -387,6 +432,40 @@ mod tests {
         assert_eq!(sanitize_metric_name("time full"), "time_full");
         assert_eq!(sanitize_metric_name("Request-Size"), "request_size");
         assert_eq!(sanitize_metric_name("a.b.c"), "a_b_c");
+    }
+
+    #[test]
+    fn sanitize_label_names() {
+        assert_eq!(sanitize_label_name("method"), "method");
+        assert_eq!(sanitize_label_name(""), "unknown");
+        assert_eq!(sanitize_label_name("1status"), "_status");
+        assert_eq!(sanitize_label_name("stat.us"), "stat_us");
+        assert_eq!(sanitize_label_name("мethod"), "__ethod");
+    }
+
+    #[test]
+    fn parse_stat_key_empty_method_label() {
+        // Regression: `grpc_method_name("/")` used to return "", which made
+        // `processed___method__{method}___status__<status>` render as
+        // `processed___method_____status__success`. The orphaned `__status__...`
+        // segment parsed to an empty label name and panicked GaugeVec::new
+        // (metrics.rs:230), poisoning the registry and taking all metrics down.
+        let (name, labels) = parse_stat_key("processed___method_____status__success");
+        assert_eq!(name, "processed");
+        assert_eq!(
+            labels,
+            vec![("unknown".to_string(), "status__success".to_string())]
+        );
+        // With the fallback the happy path keeps method+status labels intact.
+        let (name, labels) = parse_stat_key("processed___method__unknown___status__success");
+        assert_eq!(name, "processed");
+        assert_eq!(
+            labels,
+            vec![
+                ("method".to_string(), "unknown".to_string()),
+                ("status".to_string(), "success".to_string())
+            ]
+        );
     }
 
     #[test]
