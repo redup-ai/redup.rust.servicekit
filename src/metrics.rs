@@ -136,11 +136,7 @@ pub fn sanitize_label_name(name: &str) -> String {
         } else {
             b.is_ascii_alphanumeric() || b == b'_'
         };
-        out.push(if ok {
-            b as char
-        } else {
-            '_'
-        });
+        out.push(if ok { b as char } else { '_' });
     }
     if out.is_empty() {
         out.push_str("unknown");
@@ -157,10 +153,7 @@ pub fn parse_stat_key(key: &str) -> (String, Vec<(String, String)>) {
     let mut labels = Vec::new();
     for label_part in rest.split("___").filter(|s| !s.is_empty()) {
         if let Some((label_name, label_value)) = label_part.split_once("__") {
-            labels.push((
-                sanitize_label_name(label_name),
-                label_value.to_string(),
-            ));
+            labels.push((sanitize_label_name(label_name), label_value.to_string()));
         }
     }
     (name.to_string(), labels)
@@ -233,10 +226,7 @@ impl MetricsRegistry {
 
     /// Get or create a `CounterVec` (counter with `inittime` label).
     pub fn counter_vec(&self, name: &str, help: &str, extra_labels: &[&str]) -> CounterVec {
-        let mut cache = self
-            .counter_vecs
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut cache = self.counter_vecs.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(c) = cache.get(name) {
             return c.clone();
         }
@@ -253,10 +243,7 @@ impl MetricsRegistry {
 
     /// Get or create a `GaugeVec` (gauge with `inittime` label).
     pub fn gauge_vec(&self, name: &str, help: &str, extra_labels: &[&str]) -> GaugeVec {
-        let mut cache = self
-            .gauge_vecs
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut cache = self.gauge_vecs.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(g) = cache.get(name) {
             return g.clone();
         }
@@ -313,20 +300,14 @@ impl MetricsRegistry {
 
     /// Gauge value getter for the `inittime`-only series (used by refresh).
     pub fn gauge_value(&self, name: &str) -> Option<f64> {
-        let cache = self
-            .gauge_vecs
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let cache = self.gauge_vecs.lock().unwrap_or_else(|e| e.into_inner());
         let vec = cache.get(name)?;
         Some(vec.with_label_values(&[self.inittime.as_str()]).get())
     }
 
     /// Counter value getter for the `inittime`-only series (used by refresh).
     pub fn counter_value(&self, name: &str) -> Option<f64> {
-        let cache = self
-            .counter_vecs
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let cache = self.counter_vecs.lock().unwrap_or_else(|e| e.into_inner());
         let vec = cache.get(name)?;
         Some(vec.with_label_values(&[self.inittime.as_str()]).get())
     }
