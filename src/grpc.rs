@@ -118,13 +118,22 @@ where
 /// Tonic maps `/service.Method/Call` to `service.Method`, so the method
 /// component (last path segment) is the called handler name, e.g.
 /// `/doaid.users.v1.UsersService/CreateUser` -> `CreateUser`.
+///
+/// Empty or root paths (`/`, `//`) have no method; they fall back to
+/// `unknown` so per-method stat keys never contain an empty label value
+/// (empty values make `parse_stat_key` produce an empty label name, which
+/// panics `GaugeVec::new` and poisons the whole metrics registry).
 pub fn grpc_method_name(path: &str) -> String {
     let trimmed = path.trim_start_matches('/');
-    trimmed
+    let method = trimmed
         .rsplit_once('/')
         .map(|(_, method)| method)
-        .unwrap_or(trimmed)
-        .to_string()
+        .unwrap_or(trimmed);
+    if method.is_empty() {
+        "unknown".to_string()
+    } else {
+        method.to_string()
+    }
 }
 
 #[cfg(test)]
@@ -142,6 +151,8 @@ mod tests {
         );
         assert_eq!(grpc_method_name("/abc.Def/H"), "H");
         assert_eq!(grpc_method_name("/x/y/z"), "z");
+        assert_eq!(grpc_method_name("/"), "unknown");
+        assert_eq!(grpc_method_name("//"), "unknown");
     }
 
     #[tokio::test]
@@ -175,6 +186,33 @@ mod tests {
         assert!(
             line.ends_with(" 1"),
             "stats_request must be 1 after one call, got: {line}"
+        );
+    }
+
+    #[tokio::test]
+    async fn root_path_does_not_poison_metrics() {
+        // Regression: a request to "/" (e.g. ingress health check / plain
+        // HTTP GET against the gRPC port) must not panic inside the metrics
+        // layer; it is labeled `method="unknown"` and never empties the
+        // `method` label name.
+        let kit = ServiceKit::new(MonitorServerConfig::default(), 4, Some(2));
+        let layer = GrpcMetricsLayer::new(kit.clone());
+        let mut svc = layer.layer(EchoService);
+        let request = HttpRequest::builder()
+            .method(Method::POST)
+            .uri(Uri::from_static("/"))
+            .body(empty_body())
+            .unwrap();
+        let _ = svc.call(request).await;
+        let bytes = kit.metrics_text();
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(
+            text.contains("method=\"unknown\""),
+            "root request must be labeled unknown, got: {text}"
+        );
+        assert!(
+            text.contains("stats_request") && text.contains("stats_processed{"),
+            "metrics must be exported after root request"
         );
     }
 
