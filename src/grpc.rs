@@ -44,6 +44,42 @@ impl<S> Layer<S> for GrpcMetricsLayer {
     }
 }
 
+/// RAII guard for the in-flight gRPC task metric.
+///
+/// `GrpcMetricsService::call` must finish the tracked task exactly once per
+/// request. A regular completion calls [`finish`](Self::finish) (records the
+/// duration); if the handler future is dropped mid-flight — client gone,
+/// proxy reset, deadline at the edge — the guard's `Drop` discards the task
+/// so `tasks_count` / `current_tasks_max_time_spend` cannot grow forever.
+struct TaskGuard {
+    kit: Arc<ServiceKit>,
+    id: Option<String>,
+}
+
+impl TaskGuard {
+    fn start(kit: &Arc<ServiceKit>) -> Self {
+        let id = kit.task_tracker().start();
+        Self {
+            kit: kit.clone(),
+            id: Some(id),
+        }
+    }
+
+    fn finish(&mut self) {
+        if let Some(id) = self.id.take() {
+            self.kit.task_tracker().finish(&id);
+        }
+    }
+}
+
+impl Drop for TaskGuard {
+    fn drop(&mut self) {
+        if let Some(id) = self.id.take() {
+            self.kit.task_tracker().discard(&id);
+        }
+    }
+}
+
 /// Service wrapper produced by [`GrpcMetricsLayer`].
 #[derive(Clone)]
 pub struct GrpcMetricsService<S> {
@@ -73,12 +109,12 @@ where
         let start = std::time::Instant::now();
         kit.init_method(&method);
         kit.inc_stat(&format!("request___method__{method}"), 1.0);
-        let task_id = kit.task_tracker().start();
+        let mut guard = TaskGuard::start(&kit);
 
         let future = async move {
             let result = inner.call(req).await;
             let elapsed = start.elapsed().as_secs_f64();
-            kit.task_tracker().finish(&task_id);
+            guard.finish();
 
             match result {
                 Ok(response) => {
@@ -241,6 +277,36 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn dropped_request_does_not_leak_task() {
+        // Regression: client cancels the RPC before the handler future
+        // completes; the in-flight task must be discarded on drop instead of
+        // staying in `tasks` forever (tasks_count/current_tasks_max_time_spend
+        // would otherwise grow unboundedly).
+        let kit = ServiceKit::new(MonitorServerConfig::default(), 4, Some(2));
+        let mut svc = GrpcMetricsLayer::new(kit.clone()).layer(NeverService);
+
+        let request = HttpRequest::builder()
+            .method(Method::POST)
+            .uri(Uri::from_static("/doaid.users.v1.UsersService/CreateUser"))
+            .body(empty_body())
+            .unwrap();
+        let fut = svc.call(request);
+        assert_eq!(kit.task_tracker().in_flight(), 1);
+        drop(fut);
+        assert_eq!(kit.task_tracker().in_flight(), 0);
+
+        // A normal completion must not double-count or under-count.
+        let mut svc = GrpcMetricsLayer::new(kit.clone()).layer(EchoService);
+        let request = HttpRequest::builder()
+            .method(Method::POST)
+            .uri(Uri::from_static("/doaid.users.v1.UsersService/CreateUser"))
+            .body(empty_body())
+            .unwrap();
+        let _ = svc.call(request).await;
+        assert_eq!(kit.task_tracker().in_flight(), 0);
+    }
+
     #[derive(Clone)]
     struct EchoService;
 
@@ -256,6 +322,26 @@ mod tests {
         fn call(&mut self, _req: HttpRequest<BoxBody>) -> Self::Future {
             let _ = _req;
             Box::pin(async move { Ok(HttpResponse::new(empty_body())) })
+        }
+    }
+
+    /// A service whose future never resolves; dropping that future simulates
+    /// a client cancel / reset mid-request.
+    #[derive(Clone)]
+    struct NeverService;
+
+    impl Service<HttpRequest<BoxBody>> for NeverService {
+        type Response = HttpResponse<BoxBody>;
+        type Error = tonic::Status;
+        type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+
+        fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn call(&mut self, _req: HttpRequest<BoxBody>) -> Self::Future {
+            let _ = _req;
+            Box::pin(std::future::pending())
         }
     }
 }
