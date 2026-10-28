@@ -222,10 +222,21 @@ impl HttpBody for CountingBody {
                 if let Some(data) = frame.data_ref() {
                     this.counter.add(data.len());
                 }
+                // gRPC over HTTP/2 marks the end of a response with a
+                // trailers frame; hyper may stop polling after trailers, so a
+                // later `Poll::Ready(None)` may never reach us. Fire the size
+                // metric here, on the trailers frame, to guarantee it is
+                // emitted exactly once. `on_end` is take()'n, so a subsequent
+                // terminal poll is a no-op.
+                if frame.is_trailers() {
+                    if let Some(cb) = this.on_end.take() {
+                        cb(this.counter.load(Ordering::Relaxed));
+                    }
+                }
                 Poll::Ready(Some(Ok(frame)))
             }
             Poll::Ready(Some(Err(e))) => Poll::Ready(Some(Err(e))),
-            // End of stream: fire the size metric exactly once.
+            // End of stream: fire the size metric if not already emitted.
             Poll::Ready(None) => {
                 if let Some(cb) = this.on_end.take() {
                     cb(this.counter.load(Ordering::Relaxed));
@@ -516,11 +527,18 @@ mod tests {
                 {}
                 // Return a non-empty body so the response-size histogram is
                 // counted too (an empty body would correctly give sum 0).
-                let resp_body = tonic::body::boxed(
+                // Use `with_trailers` so the body emits a trailers frame like
+                // real gRPC responses do; the metrics CountingBody fires its
+                // `on_end` on the trailers frame, not only on a terminal None.
+                let resp_body =
                     http_body_util::Full::new(axum::body::Bytes::from_static(b"a gRPC response"))
-                        .map_err(|e| e),
-                );
-                Ok(HttpResponse::new(resp_body))
+                        .map_err(|e| e)
+                        .with_trailers(async {
+                            let mut map = http::HeaderMap::new();
+                            map.insert("grpc-status", "0".parse().unwrap());
+                            Some(Ok(map))
+                        });
+                Ok(HttpResponse::new(tonic::body::boxed(resp_body)))
             })
         }
     }
