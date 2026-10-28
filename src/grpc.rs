@@ -119,12 +119,15 @@ where
         let request_metric = kit.clone();
         let request_method = method.clone();
         let (req_parts, req_body) = req.into_parts();
-        let req_body = CountingBody::new(req_body, Some(Box::new(move |bytes: usize| {
-            request_metric.observe_stat(
-                &format!("request_size___method__{request_method}"),
-                bytes as f64,
-            );
-        })))
+        let req_body = CountingBody::new(
+            req_body,
+            Some(Box::new(move |bytes: usize| {
+                request_metric.observe_stat(
+                    &format!("request_size___method__{request_method}"),
+                    bytes as f64,
+                );
+            })),
+        )
         .boxed_unsync();
         let req = Request::from_parts(req_parts, req_body);
         let mut inner = self.inner.clone();
@@ -144,12 +147,15 @@ where
                     let response_metric = kit.clone();
                     let response_method = method.clone();
                     let (resp_parts, resp_body) = response.into_parts();
-                    let resp_body = CountingBody::new(resp_body, Some(Box::new(move |bytes: usize| {
-                        response_metric.observe_stat(
-                            &format!("response_size___method__{response_method}"),
-                            bytes as f64,
-                        );
-                    })))
+                    let resp_body = CountingBody::new(
+                        resp_body,
+                        Some(Box::new(move |bytes: usize| {
+                            response_metric.observe_stat(
+                                &format!("response_size___method__{response_method}"),
+                                bytes as f64,
+                            );
+                        })),
+                    )
                     .boxed_unsync();
                     let response = Response::from_parts(resp_parts, resp_body);
 
@@ -192,10 +198,7 @@ struct CountingBody {
 }
 
 impl CountingBody {
-    fn new(
-        inner: BoxBody,
-        on_end: Option<Box<dyn FnOnce(usize) + Send>>,
-    ) -> Self {
+    fn new(inner: BoxBody, on_end: Option<Box<dyn FnOnce(usize) + Send>>) -> Self {
         Self {
             inner,
             counter: Arc::new(ByteCounter::new()),
@@ -217,7 +220,7 @@ impl HttpBody for CountingBody {
             // Count the actual bytes of each DATA frame.
             Poll::Ready(Some(Ok(frame))) => {
                 if let Some(data) = frame.data_ref() {
-                    this.counter.add(data.len() as usize);
+                    this.counter.add(data.len());
                 }
                 Poll::Ready(Some(Ok(frame)))
             }
@@ -430,10 +433,10 @@ mod tests {
         let mut svc = GrpcMetricsLayer::new(kit.clone()).layer(EchoService);
 
         // Non-empty request body (must be drained by the handler to count).
-        let body = tonic::body::boxed(http_body_util::Full::new(axum::body::Bytes::from_static(
-            b"hello gRPC world",
-        ))
-        .map_err(|e| e));
+        let body = tonic::body::boxed(
+            http_body_util::Full::new(axum::body::Bytes::from_static(b"hello gRPC world"))
+                .map_err(|e| e),
+        );
         let request = HttpRequest::builder()
             .method(Method::POST)
             .uri(Uri::from_static("/doaid.users.v1.UsersService/CreateUser"))
@@ -454,9 +457,17 @@ mod tests {
         // body was buffered by tonic decode, so it should be counted.
         let req_line = text
             .lines()
-            .find(|l| l.starts_with("stats_hist_request_size_sum") && l.contains("method=\"CreateUser\""))
+            .find(|l| {
+                l.starts_with("stats_hist_request_size_sum") && l.contains("method=\"CreateUser\"")
+            })
             .expect("request_size_sum");
-        let req_sum = req_line.rsplit(' ').next().unwrap().trim().parse::<f64>().unwrap();
+        let req_sum = req_line
+            .rsplit(' ')
+            .next()
+            .unwrap()
+            .trim()
+            .parse::<f64>()
+            .unwrap();
         assert!(
             req_sum > 0.0,
             "request_size_sum must be > 0, got: {req_line}"
@@ -464,9 +475,17 @@ mod tests {
 
         let resp_line = text
             .lines()
-            .find(|l| l.starts_with("stats_hist_response_size_sum") && l.contains("method=\"CreateUser\""))
+            .find(|l| {
+                l.starts_with("stats_hist_response_size_sum") && l.contains("method=\"CreateUser\"")
+            })
             .expect("response_size_sum");
-        let resp_sum = resp_line.rsplit(' ').next().unwrap().trim().parse::<f64>().unwrap();
+        let resp_sum = resp_line
+            .rsplit(' ')
+            .next()
+            .unwrap()
+            .trim()
+            .parse::<f64>()
+            .unwrap();
         assert!(
             resp_sum > 0.0,
             "response_size_sum must be > 0, got: {resp_line}"
@@ -498,10 +517,8 @@ mod tests {
                 // Return a non-empty body so the response-size histogram is
                 // counted too (an empty body would correctly give sum 0).
                 let resp_body = tonic::body::boxed(
-                    http_body_util::Full::new(axum::body::Bytes::from_static(
-                        b"a gRPC response",
-                    ))
-                    .map_err(|e| e),
+                    http_body_util::Full::new(axum::body::Bytes::from_static(b"a gRPC response"))
+                        .map_err(|e| e),
                 );
                 Ok(HttpResponse::new(resp_body))
             })
