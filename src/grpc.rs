@@ -12,10 +12,14 @@
 //! it wraps the service and maps HTTP requests to gRPC service/method names.
 
 use crate::monitor::ServiceKit;
+use axum::body::Bytes;
 use http::{Request, Response};
 use http_body::Body as HttpBody;
+use http_body::{Frame, SizeHint};
+use http_body_util::BodyExt;
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use tonic::body::BoxBody;
@@ -103,7 +107,26 @@ where
     fn call(&mut self, req: Request<BoxBody>) -> Self::Future {
         let method = grpc_method_name(req.uri().path());
         let kit = self.kit.clone();
-        let request_size = req.body().size_hint().exact().unwrap_or(0) as f64;
+
+        // gRPC request/response bodies are streamed lazily, so
+        // `size_hint().exact()` is always `None` — which made
+        // `request_size`/`response_size` observe `0` to the histograms.
+        // Instead, wrap each body in a counter that records the real wire
+        // byte size as its frames are polled, and observe the metric in the
+        // body's `on_end` hook, which fires exactly once once the stream is
+        // fully drained (request: consumed by the handler; response: written
+        // over the wire). This yields real, non-zero sizes.
+        let request_metric = kit.clone();
+        let request_method = method.clone();
+        let (req_parts, req_body) = req.into_parts();
+        let req_body = CountingBody::new(req_body, Some(Box::new(move |bytes: usize| {
+            request_metric.observe_stat(
+                &format!("request_size___method__{request_method}"),
+                bytes as f64,
+            );
+        })))
+        .boxed_unsync();
+        let req = Request::from_parts(req_parts, req_body);
         let mut inner = self.inner.clone();
 
         let start = std::time::Instant::now();
@@ -118,14 +141,23 @@ where
 
             match result {
                 Ok(response) => {
-                    let response_size = response.body().size_hint().exact().unwrap_or(0) as f64;
+                    let response_metric = kit.clone();
+                    let response_method = method.clone();
+                    let (resp_parts, resp_body) = response.into_parts();
+                    let resp_body = CountingBody::new(resp_body, Some(Box::new(move |bytes: usize| {
+                        response_metric.observe_stat(
+                            &format!("response_size___method__{response_method}"),
+                            bytes as f64,
+                        );
+                    })))
+                    .boxed_unsync();
+                    let response = Response::from_parts(resp_parts, resp_body);
+
                     kit.inc_stat(
                         &format!("processed___method__{method}___status__success"),
                         1.0,
                     );
                     kit.observe_stat(&format!("time full___method__{method}"), elapsed);
-                    kit.observe_stat(&format!("request_size___method__{method}"), request_size);
-                    kit.observe_stat(&format!("response_size___method__{method}"), response_size);
                     kit.set_task_status(crate::monitor::TaskStatus::Ok, &method);
                     Ok(response)
                 }
@@ -140,13 +172,94 @@ where
                         1.0,
                     );
                     kit.observe_stat(&format!("time full___method__{method}"), elapsed);
-                    kit.observe_stat(&format!("request_size___method__{method}"), request_size);
                     kit.set_task_status(crate::monitor::TaskStatus::OtherException, &method);
                     Err(error)
                 }
             }
         };
         Box::pin(future)
+    }
+}
+
+/// Wraps a body and counts the bytes of every DATA frame it yields,
+/// invoking `on_end` with the accumulated total exactly once, when the
+/// stream is fully drained. Used for both requests and responses in the
+/// gRPC case, where `size_hint().exact()` is `None`.
+struct CountingBody {
+    inner: BoxBody,
+    counter: Arc<ByteCounter>,
+    on_end: Option<Box<dyn FnOnce(usize) + Send>>,
+}
+
+impl CountingBody {
+    fn new(
+        inner: BoxBody,
+        on_end: Option<Box<dyn FnOnce(usize) + Send>>,
+    ) -> Self {
+        Self {
+            inner,
+            counter: Arc::new(ByteCounter::new()),
+            on_end,
+        }
+    }
+}
+
+impl HttpBody for CountingBody {
+    type Data = Bytes;
+    type Error = tonic::Status;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        let this = self.as_mut().get_mut();
+        match Pin::new(&mut this.inner).poll_frame(cx) {
+            // Count the actual bytes of each DATA frame.
+            Poll::Ready(Some(Ok(frame))) => {
+                if let Some(data) = frame.data_ref() {
+                    this.counter.add(data.len() as usize);
+                }
+                Poll::Ready(Some(Ok(frame)))
+            }
+            Poll::Ready(Some(Err(e))) => Poll::Ready(Some(Err(e))),
+            // End of stream: fire the size metric exactly once.
+            Poll::Ready(None) => {
+                if let Some(cb) = this.on_end.take() {
+                    cb(this.counter.load(Ordering::Relaxed));
+                }
+                Poll::Ready(None)
+            }
+            Poll::Pending => Poll::Pending,
+        }
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        self.inner.size_hint()
+    }
+}
+
+/// Shared accumulator for a [`CountingBody`].
+struct ByteCounter {
+    bytes: AtomicUsize,
+}
+
+impl ByteCounter {
+    fn new() -> Self {
+        Self {
+            bytes: AtomicUsize::new(0),
+        }
+    }
+
+    fn add(&self, n: usize) {
+        self.bytes.fetch_add(n, Ordering::Relaxed);
+    }
+
+    fn load(&self, o: Ordering) -> usize {
+        self.bytes.load(o)
     }
 }
 
@@ -307,6 +420,59 @@ mod tests {
         assert_eq!(kit.task_tracker().in_flight(), 0);
     }
 
+    #[tokio::test]
+    async fn request_response_size_are_non_zero() {
+        // Regression: gRPC bodies are streamed lazily, so `size_hint()` is
+        // `None` and `request_size`/`response_size` used to observe `0`.
+        // The CountingBody wraps the bodies and records the real bytes as the
+        // frames are polled, so the histograms must end up with a sum > 0.
+        let kit = ServiceKit::new(MonitorServerConfig::default(), 4, Some(2));
+        let mut svc = GrpcMetricsLayer::new(kit.clone()).layer(EchoService);
+
+        // Non-empty request body (must be drained by the handler to count).
+        let body = tonic::body::boxed(http_body_util::Full::new(axum::body::Bytes::from_static(
+            b"hello gRPC world",
+        ))
+        .map_err(|e| e));
+        let request = HttpRequest::builder()
+            .method(Method::POST)
+            .uri(Uri::from_static("/doaid.users.v1.UsersService/CreateUser"))
+            .body(body)
+            .unwrap();
+        let resp = svc.call(request).await.unwrap();
+
+        // Drain the response body so the CountingBody sees the end-of-stream
+        // and fires its `on_end` observation once.
+        let mut m = std::pin::pin!(resp.into_body());
+        while std::future::poll_fn(|cx| m.as_mut().poll_frame(cx))
+            .await
+            .is_some()
+        {}
+
+        let text = String::from_utf8_lossy(&kit.metrics_text()).to_string();
+        // request_size was counted when the (empty) handler drained — full
+        // body was buffered by tonic decode, so it should be counted.
+        let req_line = text
+            .lines()
+            .find(|l| l.starts_with("stats_hist_request_size_sum") && l.contains("method=\"CreateUser\""))
+            .expect("request_size_sum");
+        let req_sum = req_line.rsplit(' ').next().unwrap().trim().parse::<f64>().unwrap();
+        assert!(
+            req_sum > 0.0,
+            "request_size_sum must be > 0, got: {req_line}"
+        );
+
+        let resp_line = text
+            .lines()
+            .find(|l| l.starts_with("stats_hist_response_size_sum") && l.contains("method=\"CreateUser\""))
+            .expect("response_size_sum");
+        let resp_sum = resp_line.rsplit(' ').next().unwrap().trim().parse::<f64>().unwrap();
+        assert!(
+            resp_sum > 0.0,
+            "response_size_sum must be > 0, got: {resp_line}"
+        );
+    }
+
     #[derive(Clone)]
     struct EchoService;
 
@@ -319,9 +485,26 @@ mod tests {
             Poll::Ready(Ok(()))
         }
 
-        fn call(&mut self, _req: HttpRequest<BoxBody>) -> Self::Future {
-            let _ = _req;
-            Box::pin(async move { Ok(HttpResponse::new(empty_body())) })
+        fn call(&mut self, req: HttpRequest<BoxBody>) -> Self::Future {
+            Box::pin(async move {
+                // Drain the request body so the metrics CountingBody sees the
+                // end-of-stream and fires its `on_end` observation (tonic does
+                // this in production when it decodes the request message).
+                let mut req_body = std::pin::pin!(req.into_body());
+                while std::future::poll_fn(|cx| req_body.as_mut().poll_frame(cx))
+                    .await
+                    .is_some()
+                {}
+                // Return a non-empty body so the response-size histogram is
+                // counted too (an empty body would correctly give sum 0).
+                let resp_body = tonic::body::boxed(
+                    http_body_util::Full::new(axum::body::Bytes::from_static(
+                        b"a gRPC response",
+                    ))
+                    .map_err(|e| e),
+                );
+                Ok(HttpResponse::new(resp_body))
+            })
         }
     }
 
