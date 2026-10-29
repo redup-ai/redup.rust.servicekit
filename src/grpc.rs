@@ -22,7 +22,9 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::task::{Context, Poll};
+use tokio::sync::Semaphore;
 use tonic::body::BoxBody;
+use tonic::Status;
 use tower::{Layer, Service};
 
 /// Tonic layer that records metrics around each gRPC request.
@@ -184,6 +186,97 @@ where
             }
         };
         Box::pin(future)
+    }
+}
+
+/// Boxed error type accepted by tonic's `Server::layer` stack
+/// (`tonic::transport::Error` / `crate::Error` is `Box<dyn Error + Send + Sync>`).
+type BoxError = Box<dyn std::error::Error + Send + Sync + 'static>;
+
+/// Tonic layer that limits the number of concurrent in-flight gRPC requests
+/// across the whole server — **all methods share one semaphore**, mirroring
+/// Python `grpc.aio.server(maximum_concurrent_rpcs = grpc_queue_size)`.
+///
+/// Unlike `tower::limit::ConcurrencyLimit`, which **queues** requests and
+/// keeps them buffered in memory (precisely the OOM pattern this layer is
+/// meant to remove), [`ConcurrencyLimitLayer`] rejects immediately with gRPC
+/// `RESOURCE_EXHAUSTED` (code 8) once the in-flight budget is exhausted. The
+/// caller is signalled to retry elsewhere instead of piling up memory.
+///
+/// Tonic wraps the whole user layer stack with `RecoverError`, which converts
+/// any `Err(Status)` returned here into a real `grpc-status` trailer — so the
+/// rejection reaches the client as code 8 on the wire.
+#[derive(Clone)]
+pub struct ConcurrencyLimitLayer {
+    semaphore: Arc<Semaphore>,
+}
+
+impl ConcurrencyLimitLayer {
+    /// `limit` is the maximum number of requests that may be in-flight at once
+    /// across the entire server (Python `grpc_queue_size`).
+    pub fn new(limit: usize) -> Self {
+        Self {
+            semaphore: Arc::new(Semaphore::new(limit)),
+        }
+    }
+}
+
+impl<S> Layer<S> for ConcurrencyLimitLayer {
+    type Service = ConcurrencyLimitService<S>;
+
+    fn layer(&self, inner: S) -> Self::Service {
+        ConcurrencyLimitService {
+            inner,
+            semaphore: self.semaphore.clone(),
+        }
+    }
+}
+
+/// Service wrapper produced by [`ConcurrencyLimitLayer`].
+#[derive(Clone)]
+pub struct ConcurrencyLimitService<S> {
+    inner: S,
+    semaphore: Arc<Semaphore>,
+}
+
+impl<S> Service<Request<BoxBody>> for ConcurrencyLimitService<S>
+where
+    S: Service<Request<BoxBody>, Response = Response<BoxBody>> + Clone + Send + 'static,
+    S::Future: Send + 'static,
+    S::Error: Into<BoxError>,
+{
+    type Response = Response<BoxBody>;
+    type Error = BoxError;
+    type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(cx).map_err(Into::into)
+    }
+
+    fn call(&mut self, req: Request<BoxBody>) -> Self::Future {
+        // Acquire a permit immediately and do NOT queue: when the global
+        // in-flight budget is exhausted, reject with RESOURCE_EXHAUSTED (code
+        // 8) so the caller retries elsewhere instead of the request piling up
+        // in memory (the cause of the prod OOM restarts).
+        let permit = match self.semaphore.clone().try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(_) => {
+                return Box::pin(async move {
+                    Err(Status::resource_exhausted(
+                        "service is overloaded, please retry later",
+                    )
+                    .into())
+                });
+            }
+        };
+
+        let mut inner = self.inner.clone();
+        Box::pin(async move {
+            // Held for the duration of the handler future; released on drop
+            // (including when the handler future is cancelled mid-flight).
+            let _permit = permit;
+            inner.call(req).await.map_err(Into::into)
+        })
     }
 }
 
@@ -503,6 +596,72 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn concurrency_limit_rejects_when_budget_exhausted() {
+        // Global in-flight budget of 1 across the whole server. The first
+        // request acquires the only permit and blocks, so the second
+        // concurrent request must be rejected with gRPC RESOURCE_EXHAUSTED
+        // (code 8) — not queued/buffered.
+        let layer = ConcurrencyLimitLayer::new(1);
+        let mut svc = layer.layer(BlockingService);
+
+        let build_req = || {
+            HttpRequest::builder()
+                .method(Method::POST)
+                .uri(Uri::from_static("/doaid.users.v1.UsersService/CreateUser"))
+                .body(empty_body())
+                .unwrap()
+        };
+
+        let first = svc.call(build_req());
+        // Give the first request a chance to acquire the only permit.
+        tokio::task::yield_now().await;
+
+        assert_eq!(layer.semaphore.available_permits(), 0);
+
+        let second = svc.call(build_req()).await;
+        let err = match second {
+            Ok(_) => panic!("second request must be rejected when budget exhausted"),
+            Err(e) => e,
+        };
+        let err = err
+            .downcast::<tonic::Status>()
+            .expect("rejection must be a tonic::Status");
+        assert_eq!(
+            err.code(),
+            tonic::Code::ResourceExhausted,
+            "expected RESOURCE_EXHAUSTED (8), got: {err}"
+        );
+
+        // The blocking first request still holds the permit; drop it (a
+        // cancelled client / dropped future should release the permit).
+        drop(first);
+        tokio::task::yield_now().await;
+        assert_eq!(layer.semaphore.available_permits(), 1);
+    }
+
+    #[tokio::test]
+    async fn concurrency_limit_allows_within_budget() {
+        let layer = ConcurrencyLimitLayer::new(2);
+        let mut svc = layer.layer(EchoService);
+
+        let build_req = || {
+            HttpRequest::builder()
+                .method(Method::POST)
+                .uri(Uri::from_static("/doaid.users.v1.UsersService/CreateUser"))
+                .body(empty_body())
+                .unwrap()
+        };
+
+        // Two requests within the budget of 2 both succeed.
+        let r1 = svc.call(build_req()).await.expect("first request");
+        let r2 = svc.call(build_req()).await.expect("second request");
+        assert_eq!(r1.status(), http::StatusCode::OK);
+        assert_eq!(r2.status(), http::StatusCode::OK);
+        // Permits released after completion.
+        assert_eq!(layer.semaphore.available_permits(), 2);
+    }
+
     #[derive(Clone)]
     struct EchoService;
 
@@ -540,6 +699,27 @@ mod tests {
                         });
                 Ok(HttpResponse::new(tonic::body::boxed(resp_body)))
             })
+        }
+    }
+
+    /// A service whose request never resolves; the in-flight permit it
+    /// acquired stays held until the future is dropped. Used to hold the
+    /// semaphore budget deterministically so a concurrent request can be
+    /// observed being rejected.
+    #[derive(Clone)]
+    struct BlockingService;
+
+    impl Service<HttpRequest<BoxBody>> for BlockingService {
+        type Response = HttpResponse<BoxBody>;
+        type Error = tonic::Status;
+        type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+
+        fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn call(&mut self, _req: HttpRequest<BoxBody>) -> Self::Future {
+            Box::pin(std::future::pending())
         }
     }
 
