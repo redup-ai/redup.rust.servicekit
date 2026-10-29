@@ -262,10 +262,10 @@ where
             Ok(permit) => permit,
             Err(_) => {
                 return Box::pin(async move {
-                    Err(Status::resource_exhausted(
-                        "service is overloaded, please retry later",
+                    Err(
+                        Status::resource_exhausted("service is overloaded, please retry later")
+                            .into(),
                     )
-                    .into())
                 });
             }
         };
