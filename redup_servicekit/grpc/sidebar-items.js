@@ -1,1 +1,1 @@
-window.SIDEBAR_ITEMS = {"fn":["grpc_method_name"],"struct":["GrpcMetricsLayer","GrpcMetricsService"]};
+window.SIDEBAR_ITEMS = {"fn":["grpc_method_name"],"struct":["ConcurrencyLimitLayer","ConcurrencyLimitService","GrpcMetricsLayer","GrpcMetricsService"]};
