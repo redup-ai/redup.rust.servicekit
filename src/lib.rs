@@ -31,6 +31,9 @@ pub mod metrics;
 pub mod monitor;
 pub mod reflection;
 
+/// Re-export the gRPC concurrency-limit layer for a one-line server setup.
+pub use grpc::{ConcurrencyLimitLayer, ConcurrencyLimitService};
+
 pub use config::{Config, MonitorServerConfig, ServiceInfoEntry};
 pub use monitor::{ReadyProbe, ServiceKit, TaskStatus, TaskTracker};
 
