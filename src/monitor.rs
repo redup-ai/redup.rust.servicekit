@@ -14,6 +14,19 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+/// Distinct error type strings from `MonitorServer.errors` config (`service_errors`),
+/// used to classify a backend failure into `stats_errors{method,type}`. The string
+/// `"other"` is excluded because it is the default bucket, mirroring Python
+/// `ErrorParser._types`.
+fn collect_error_types(monitor: &MonitorServerConfig) -> Vec<String> {
+    monitor
+        .resolved_errors()
+        .values()
+        .flat_map(|e| e.service_errors.iter().cloned())
+        .filter(|t| !t.is_empty() && t != "other")
+        .collect()
+}
+
 /// Task outcome status (Python `TaskStatus`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TaskStatus {
@@ -189,6 +202,9 @@ pub struct ServiceKit {
     service_threads: u32,
     task_tracker: TaskTracker,
     ready_probe: Mutex<Option<Arc<dyn ReadyProbe>>>,
+    /// Distinct `service_errors` strings from config (minus `"other"`), for
+    /// classifying a backend failure into `stats_errors{method,type}`.
+    error_types: Vec<String>,
 }
 
 impl ServiceKit {
@@ -205,6 +221,7 @@ impl ServiceKit {
         let registry = MetricsRegistry::new(now_inittime());
         let store = Arc::new(StatsStore::new());
         let service_threads = hpa_max_workers.unwrap_or(max_workers);
+        let error_types = collect_error_types(&monitor);
 
         let kit = Arc::new(Self {
             registry: registry.clone(),
@@ -216,6 +233,7 @@ impl ServiceKit {
                 registry: registry.clone(),
             },
             ready_probe: Mutex::new(None),
+            error_types,
         });
         kit.init_metrics();
         kit
@@ -345,7 +363,7 @@ impl ServiceKit {
 
     /// Pre-register per-method stats (analog of `grpc_init_wrapper`):
     /// `request___method__M`, `processed___method__M___status__success|failure`,
-    /// `errors___method__M___type__other`.
+    /// `errors___method__M___type__<t>` for every configured error type.
     pub fn init_method(&self, method: &str) {
         self.ensure_stat(&format!("request___method__{method}"), 0.0);
         self.ensure_stat(
@@ -357,6 +375,33 @@ impl ServiceKit {
             0.0,
         );
         self.ensure_stat(&format!("errors___method__{method}___type__other"), 0.0);
+        for error_type in &self.error_types {
+            self.ensure_stat(
+                &format!("errors___method__{method}___type__{error_type}"),
+                0.0,
+            );
+        }
+    }
+
+    /// Classify a backend error message/text into an `stats_errors{type}` label.
+    ///
+    /// Mirrors Python `ErrorParser.parse`: any configured `service_errors`
+    /// string (case-insensitive substring) found in the text wins; otherwise
+    /// `"other"`. `"other"` itself is never a configured match, so it is the
+    /// fallback bucket.
+    pub fn classify_error(&self, text: &str) -> String {
+        let lower = text.to_lowercase();
+        if self.error_types.is_empty() {
+            return "other".to_string();
+        }
+        // Prefer the longlisted (first configured) match for determinism; exact
+        // substring scan over the configured set.
+        for error_type in &self.error_types {
+            if lower.contains(&error_type.to_lowercase()) {
+                return error_type.clone();
+            }
+        }
+        "other".to_string()
     }
 
     /// Observe a metric value: updates EMA long/short and, for keys with
@@ -507,5 +552,67 @@ impl ServiceKit {
             .iter()
             .map(|(k, (s, n))| (k.clone(), s.clone(), *n))
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::ErrorEntry;
+    use std::collections::BTreeMap;
+
+    fn kit_with_errors(errors: BTreeMap<String, ErrorEntry>) -> Arc<ServiceKit> {
+        let monitor = MonitorServerConfig {
+            port: 9999,
+            service_info: Default::default(),
+            errors,
+        };
+        ServiceKit::new(monitor, 4, Some(2))
+    }
+
+    fn single_error_entry(words: &[&str]) -> BTreeMap<String, ErrorEntry> {
+        let mut m = BTreeMap::new();
+        m.insert(
+            "OTHER_EXCEPTION".to_string(),
+            ErrorEntry {
+                service_errors: words.iter().map(|s| s.to_string()).collect(),
+                unhealthy: -1,
+            },
+        );
+        m
+    }
+
+    #[test]
+    fn classify_error_defaults_to_other_when_no_config() {
+        let kit = ServiceKit::new(MonitorServerConfig::default(), 4, Some(2));
+        assert_eq!(kit.classify_error("random backend failure"), "other");
+    }
+
+    #[test]
+    fn classify_error_matches_configured_service_error() {
+        let kit = kit_with_errors(single_error_entry(&["textprocessor", "translation"]));
+        assert_eq!(kit.classify_error("textprocessor: boom"), "textprocessor");
+        assert_eq!(kit.classify_error("translation: timeout"), "translation");
+    }
+
+    #[test]
+    fn classify_error_is_case_insensitive() {
+        let kit = kit_with_errors(single_error_entry(&["TextProcessor"]));
+        assert_eq!(kit.classify_error("TEXTPROCESSOR: boom"), "TextProcessor");
+    }
+
+    #[test]
+    fn classify_error_falls_back_to_other() {
+        let kit = kit_with_errors(single_error_entry(&["textprocessor"]));
+        assert_eq!(kit.classify_error("unknown failure"), "other");
+    }
+
+    #[test]
+    fn other_is_never_a_configured_match() {
+        let kit = kit_with_errors(single_error_entry(&["other", "textprocessor"]));
+        // "other" must be excluded from matching; a bare "other" in the text
+        // falls back to the default bucket.
+        assert_eq!(kit.classify_error("other something"), "other");
+        assert_eq!(kit.classify_error("textprocessor boom"), "textprocessor");
     }
 }
