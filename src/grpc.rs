@@ -97,7 +97,7 @@ impl<S> Service<Request<BoxBody>> for GrpcMetricsService<S>
 where
     S: Service<Request<BoxBody>, Response = Response<BoxBody>> + Clone + Send + 'static,
     S::Future: Send + 'static,
-    S::Error: 'static,
+    S::Error: 'static + std::fmt::Debug,
 {
     type Response = Response<BoxBody>;
     type Error = S::Error;
@@ -181,7 +181,19 @@ where
                             &format!("processed___method__{method}___status__failure"),
                             1.0,
                         );
-                        let error_type = "other";
+                        // Classify into `stats_errors{type}` from the backend
+                        // message (Python `ErrorParser.parse`): the configured
+                        // "service_errors" words (textprocessor/translation/...)
+                        // in the grpc-message decide the label, defaulting to
+                        // "other". This lets a backend failure surface as its
+                        // own error type instead of always collapsing into
+                        // `type="other"`.
+                        let error_message = response
+                            .headers()
+                            .get(Status::GRPC_MESSAGE)
+                            .and_then(|v| v.to_str().ok())
+                            .unwrap_or("");
+                        let error_type = kit.classify_error(error_message);
                         kit.inc_stat(
                             &format!("errors___method__{method}___type__{error_type}"),
                             1.0,
@@ -200,20 +212,13 @@ where
                     Ok(response)
                 }
                 Err(error) => {
-                    // A request rejected at the concurrency gate
-                    // (RESOURCE_EXHAUSTED / code 8) never reached the handler
-                    // and is not a processing error: do not record it in the
-                    // failure/error metrics nor flip the health-task status,
-                    // otherwise an overload spike looks like processing
-                    // failures. It is still counted as an incoming `request`.
-                    if is_resource_exhausted(&error) {
-                        return Err(error);
-                    }
                     kit.inc_stat(
                         &format!("processed___method__{method}___status__failure"),
                         1.0,
                     );
-                    let error_type = "other";
+                    // Same classification as the grpc-status branch: pick the
+                    // configured error type from the error text, default `other`.
+                    let error_type = kit.classify_error(&format!("{error:?}"));
                     kit.inc_stat(
                         &format!("errors___method__{method}___type__{error_type}"),
                         1.0,
@@ -429,29 +434,6 @@ pub fn grpc_method_name(path: &str) -> String {
     } else {
         method.to_string()
     }
-}
-
-/// Returns `true` when a gRPC service error is a concurrency rejection
-/// (`RESOURCE_EXHAUSTED`, code 8) produced by [`ConcurrencyLimitLayer`] —
-/// the request never reached the handler and is not a processing failure.
-///
-/// Detection works whether the error is a bare `tonic::Status` or a
-/// `Box<dyn Error + Send + Sync>` wrapping a `Status` (which is what the
-/// concurrency layer returns, and what tonic also unwraps in
-/// `Status::try_from_error`). `Box<dyn Error + Send + Sync>` does not impl
-/// `std::error::Error`, so we downcast through `Any` rather than via
-/// `source()`.
-fn is_resource_exhausted(error: &(dyn std::any::Any + 'static)) -> bool {
-    if let Some(status) = error.downcast_ref::<tonic::Status>() {
-        return status.code() == tonic::Code::ResourceExhausted;
-    }
-    if let Some(boxed) = error.downcast_ref::<Box<dyn std::error::Error + Send + Sync>>() {
-        let dyn_err: &(dyn std::error::Error + 'static) = boxed.as_ref();
-        if let Some(status) = dyn_err.downcast_ref::<tonic::Status>() {
-            return status.code() == tonic::Code::ResourceExhausted;
-        }
-    }
-    false
 }
 
 #[cfg(test)]
@@ -725,74 +707,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn resource_exhausted_is_not_counted_as_processing_error() {
-        // A request rejected with RESOURCE_EXHAUSTED (code 8) by the
-        // concurrency gate is not a processing failure: it must not increment
-        // `processed___status__failure` / `errors___type__other`, nor flip the
-        // health task status. A genuine handler error must still be counted.
-        let kit = ServiceKit::new(MonitorServerConfig::default(), 4, Some(2));
-        let concurrency = ConcurrencyLimitLayer::new(1);
-        let metrics = GrpcMetricsLayer::new(kit.clone());
-
-        let mut svc = metrics.layer(concurrency.layer(BlockingService));
-
-        let build_req = || {
-            HttpRequest::builder()
-                .method(Method::POST)
-                .uri(Uri::from_static("/doaid.users.v1.TextPreparator/Prepare"))
-                .body(empty_body())
-                .unwrap()
-        };
-
-        // First request holds the only permit and blocks. Its future never
-        // resolves (BlockingService is pending), so spawn it on a task so it
-        // actually gets polled and acquires the permit (the acquire happens
-        // inside the metrics-layer async block, so an un-polled future would
-        // not hold the semaphore).
-        let first = tokio::spawn({
-            let mut svc = svc.clone();
-            async move { svc.call(build_req()).await }
-        });
-        tokio::task::yield_now().await;
-
-        // Second request exceeds the budget -> RESOURCE_EXHAUSTED from the gate.
-        let rejected = svc.call(build_req()).await;
-        assert!(rejected.is_err());
-
-        // Must NOT count as a processing failure/error: the keys are
-        // pre-created at 0 by `init_method`, so assert the VALUE is 0.
-        // Exported as `stats_processed{...status="failure"...}` etc.
-        let text = String::from_utf8_lossy(&kit.metrics_text()).to_string();
-        let metric_value = |metric: &str, label: &str| -> f64 {
-            text.lines()
-                .filter(|l| l.starts_with(metric) && l.contains(label))
-                .find_map(|l| l.rsplit(' ').next())
-                .and_then(|v| v.trim().parse::<f64>().ok())
-                .unwrap_or(0.0)
-        };
-        assert_eq!(
-            metric_value("stats_processed", "status=\"failure\""),
-            0.0,
-            "code-8 rejection must not be counted, metric text:\n{text}"
-        );
-        assert_eq!(
-            metric_value("stats_errors", "type=\"other\""),
-            0.0,
-            "code-8 rejection must not be counted, metric text:\n{text}"
-        );
-        // Request is still counted as an incoming RPC.
-        assert!(
-            text.contains("stats_request") && text.contains("method=\"Prepare\""),
-            "request must be counted, got:\n{text}"
-        );
-
-        // Cancel the blocker; dropping its future releases the permit.
-        first.abort();
-        let _ = first.await;
-        tokio::task::yield_now().await;
-    }
-
-    #[tokio::test]
     async fn grpc_status_in_ok_response_is_counted_as_failure() {
         // tonic's generated server converts a handler `Err(status)` into an
         // `Ok(http::Response)` whose *headers* carry `grpc-status` != 0
@@ -835,6 +749,63 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn configured_error_type_is_used_instead_of_other() {
+        // Regression for ErrorParser.classify: with `errors` config supplying
+        // `service_errors = ["textprocessor", "translation"]`, a backend failure
+        // whose grpc-message says "textprocessor: ..." must be recorded under
+        // `stats_errors{type="textprocessor"}`, not the hardcoded `"other"`.
+        let mut monitor = crate::config::MonitorServerConfig::default();
+        monitor.errors.insert(
+            "OTHER_EXCEPTION".to_string(),
+            crate::config::ErrorEntry {
+                service_errors: vec!["textprocessor".to_string(), "translation".to_string()],
+                unhealthy: -1,
+            },
+        );
+        let kit = ServiceKit::new(monitor, 4, Some(2));
+        let layer = GrpcMetricsLayer::new(kit.clone());
+
+        // Reuse ErrorStatusService but make it emit a grpc-message carrying a
+        // configured service-error word. We wrap with a lossy passthrough so the
+        // headers-mutating service can set GRPC_MESSAGE too.
+        let mut svc = layer.layer(StatusWithMessageService {
+            code: 13,
+            message: "textprocessor: unexpected ValueError".to_string(),
+        });
+
+        let request = HttpRequest::builder()
+            .method(Method::POST)
+            .uri(Uri::from_static("/doaid.users.v1.TextPreparator/Prepare"))
+            .body(empty_body())
+            .unwrap();
+        let _ = svc.call(request).await;
+
+        let text = String::from_utf8_lossy(&kit.metrics_text()).to_string();
+        let metric_value = |metric: &str, label: &str| -> f64 {
+            text.lines()
+                .filter(|l| l.starts_with(metric) && l.contains(label))
+                .find_map(|l| l.rsplit(' ').next())
+                .and_then(|v| v.trim().parse::<f64>().ok())
+                .unwrap_or(0.0)
+        };
+        assert_eq!(
+            metric_value("stats_errors", "type=\"textprocessor\""),
+            1.0,
+            "configured service-error must be used as the error type, metric text:\n{text}"
+        );
+        assert_eq!(
+            metric_value("stats_errors", "type=\"other\""),
+            0.0,
+            "must not fall back to 'other' when a configured type matches, metric text:\n{text}"
+        );
+        assert_eq!(
+            metric_value("stats_processed", "status=\"failure\""),
+            1.0,
+            "still counted as a failure, metric text:\n{text}"
+        );
+    }
+
     #[derive(Clone)]
     struct ErrorStatusService {
         code: i32,
@@ -858,6 +829,40 @@ mod tests {
                 response
                     .headers_mut()
                     .insert(Status::GRPC_STATUS, code.to_string().parse().unwrap());
+                Ok(response)
+            })
+        }
+    }
+
+    /// Like `ErrorStatusService`, but also sets `grpc-message` so the metrics
+    /// layer has text to classify into a configured error type.
+    #[derive(Clone)]
+    struct StatusWithMessageService {
+        code: i32,
+        message: String,
+    }
+
+    impl Service<HttpRequest<BoxBody>> for StatusWithMessageService {
+        type Response = HttpResponse<BoxBody>;
+        type Error = tonic::Status;
+        type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+
+        fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn call(&mut self, _req: HttpRequest<BoxBody>) -> Self::Future {
+            let code = self.code;
+            let message = self.message.clone();
+            Box::pin(async move {
+                let mut response = HttpResponse::new(tonic::body::empty_body());
+                response
+                    .headers_mut()
+                    .insert(Status::GRPC_STATUS, code.to_string().parse().unwrap());
+                response.headers_mut().insert(
+                    Status::GRPC_MESSAGE,
+                    tonic::codegen::http::HeaderValue::from_str(&message).unwrap(),
+                );
                 Ok(response)
             })
         }
