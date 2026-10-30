@@ -147,6 +147,20 @@ where
 
             match result {
                 Ok(response) => {
+                    // tonic turns a handler `Err(Status)` into an
+                    // `Ok(http::Response)` whose headers carry the real
+                    // `grpc-status` (non-zero) — the generated service has
+                    // `Error = Infallible`, so a backend failure never
+                    // reaches this layer as `Err`. Without this check a
+                    // failed request is recorded as a success and never
+                    // lands in `stats_errors` / `processed___status__failure`.
+                    let grpc_code = response
+                        .headers()
+                        .get(Status::GRPC_STATUS)
+                        .and_then(|v| v.to_str().ok())
+                        .and_then(|v| v.parse::<i32>().ok());
+                    let is_error = grpc_code.map(|c| c != 0).unwrap_or(false);
+
                     let response_metric = kit.clone();
                     let response_method = method.clone();
                     let (resp_parts, resp_body) = response.into_parts();
@@ -161,6 +175,21 @@ where
                     )
                     .boxed_unsync();
                     let response = Response::from_parts(resp_parts, resp_body);
+
+                    if is_error {
+                        kit.inc_stat(
+                            &format!("processed___method__{method}___status__failure"),
+                            1.0,
+                        );
+                        let error_type = "other";
+                        kit.inc_stat(
+                            &format!("errors___method__{method}___type__{error_type}"),
+                            1.0,
+                        );
+                        kit.observe_stat(&format!("time full___method__{method}"), elapsed);
+                        kit.set_task_status(crate::monitor::TaskStatus::OtherException, &method);
+                        return Ok(response);
+                    }
 
                     kit.inc_stat(
                         &format!("processed___method__{method}___status__success"),
@@ -761,6 +790,77 @@ mod tests {
         first.abort();
         let _ = first.await;
         tokio::task::yield_now().await;
+    }
+
+    #[tokio::test]
+    async fn grpc_status_in_ok_response_is_counted_as_failure() {
+        // tonic's generated server converts a handler `Err(status)` into an
+        // `Ok(http::Response)` whose *headers* carry `grpc-status` != 0
+        // (the service has `Error = Infallible`, so the metrics layer never
+        // sees it as `Err`). Regression: such a request must be recorded as a
+        // failure and land in `stats_errors`, not counted as a success.
+        let kit = ServiceKit::new(MonitorServerConfig::default(), 4, Some(2));
+        let layer = GrpcMetricsLayer::new(kit.clone());
+        let mut svc = layer.layer(ErrorStatusService { code: 13 });
+
+        let request = HttpRequest::builder()
+            .method(Method::POST)
+            .uri(Uri::from_static("/doaid.users.v1.TextPreparator/Prepare"))
+            .body(empty_body())
+            .unwrap();
+        let _ = svc.call(request).await;
+
+        let text = String::from_utf8_lossy(&kit.metrics_text()).to_string();
+        let metric_value = |metric: &str, label: &str| -> f64 {
+            text.lines()
+                .filter(|l| l.starts_with(metric) && l.contains(label))
+                .find_map(|l| l.rsplit(' ').next())
+                .and_then(|v| v.trim().parse::<f64>().ok())
+                .unwrap_or(0.0)
+        };
+        assert_eq!(
+            metric_value("stats_processed", "status=\"failure\""),
+            1.0,
+            "non-zero grpc-status must be counted as a failure, metric text:\n{text}"
+        );
+        assert_eq!(
+            metric_value("stats_errors", "type=\"other\""),
+            1.0,
+            "non-zero grpc-status must be counted in stats_errors, metric text:\n{text}"
+        );
+        assert_eq!(
+            metric_value("stats_processed", "status=\"success\""),
+            0.0,
+            "non-zero grpc-status must not be counted as a success, metric text:\n{text}"
+        );
+    }
+
+    #[derive(Clone)]
+    struct ErrorStatusService {
+        code: i32,
+    }
+
+    impl Service<HttpRequest<BoxBody>> for ErrorStatusService {
+        type Response = HttpResponse<BoxBody>;
+        type Error = tonic::Status;
+        type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+
+        fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn call(&mut self, _req: HttpRequest<BoxBody>) -> Self::Future {
+            let code = self.code;
+            Box::pin(async move {
+                // Mimic tonic `Status::into_http()`: an Ok response whose
+                // immediate headers carry `grpc-status` != 0.
+                let mut response = HttpResponse::new(tonic::body::empty_body());
+                response
+                    .headers_mut()
+                    .insert(Status::GRPC_STATUS, code.to_string().parse().unwrap());
+                Ok(response)
+            })
+        }
     }
 
     #[derive(Clone)]
