@@ -237,31 +237,57 @@ where
 /// (`tonic::transport::Error` / `crate::Error` is `Box<dyn Error + Send + Sync>`).
 type BoxError = Box<dyn std::error::Error + Send + Sync + 'static>;
 
-/// Tonic layer that limits the number of concurrent in-flight gRPC requests
-/// across the whole server — **all methods share one semaphore**, mirroring
-/// Python `grpc.aio.server(maximum_concurrent_rpcs = grpc_queue_size)`.
+/// Tonic layer implementing the 3-level concurrency model of `redup.python.servicekit`:
 ///
-/// Unlike `tower::limit::ConcurrencyLimit`, which **queues** requests and
-/// keeps them buffered in memory (precisely the OOM pattern this layer is
-/// meant to remove), [`ConcurrencyLimitLayer`] rejects immediately with gRPC
-/// `RESOURCE_EXHAUSTED` (code 8) once the in-flight budget is exhausted. The
-/// caller is signalled to retry elsewhere instead of piling up memory.
+/// 1. **admission** (`grpc_queue_size`) — how many requests the pod admits into
+///    the bounded queue at all. Once the budget is exhausted, a new request is
+///    rejected immediately with gRPC `RESOURCE_EXHAUSTED` (code 8) — not buffered
+///    in memory (the prod OOM fix). This mirrors
+///    `grpc.aio.server(maximum_concurrent_rpcs = grpc_queue_size)`.
+/// 2. **workers** (`max_workers`) — how many admitted requests are actually
+///    processed in parallel at once. Requests beyond this wait inside the bounded
+///    admission queue for a free worker slot (backpressure), they are not dropped
+///    and not merged into the moses process. This is what keeps the per-pair moses
+///    subprocess from being hammered by the whole admission budget at once.
 ///
+/// `hpa_max_workers` is NOT part of this layer: it stays a metrics-only
+/// normalisation constant (`service_threads` in `monitor.rs`) that the HPA
+/// PodMetric query uses as its scale target.
+///
+/// All methods share the same pair of semaphores (mirroring the Python pool).
 /// Tonic wraps the whole user layer stack with `RecoverError`, which converts
 /// any `Err(Status)` returned here into a real `grpc-status` trailer — so the
 /// rejection reaches the client as code 8 on the wire.
+///
+/// By default `workers == admission` (i.e. every admitted request processes
+/// immediately), which keeps the historical behaviour for callers that do not
+/// opt into the `max_workers` cap with [`with_workers`](Self::with_workers).
 #[derive(Clone)]
 pub struct ConcurrencyLimitLayer {
-    semaphore: Arc<Semaphore>,
+    /// Level 1: admission/size of the bounded in-flight queue (`grpc_queue_size`).
+    admission: Arc<Semaphore>,
+    /// Level 2: number of requests actually processed in parallel (`max_workers`).
+    workers: Arc<Semaphore>,
 }
 
 impl ConcurrencyLimitLayer {
-    /// `limit` is the maximum number of requests that may be in-flight at once
-    /// across the entire server (Python `grpc_queue_size`).
+    /// `limit` is the maximum number of requests admitted into the bounded
+    /// in-flight queue across the entire server (Python `grpc_queue_size`).
     pub fn new(limit: usize) -> Self {
         Self {
-            semaphore: Arc::new(Semaphore::new(limit)),
+            admission: Arc::new(Semaphore::new(limit)),
+            // Default: no worker cap -> every admitted request is processed at
+            // once (historical behaviour).
+            workers: Arc::new(Semaphore::new(limit)),
         }
+    }
+
+    /// Cap the number of requests processed in parallel to `worker_limit`
+    /// (Python `max_workers`). Requests beyond the cap wait for a free worker
+    /// slot inside the bounded admission queue instead of being rejected.
+    pub fn with_workers(mut self, worker_limit: usize) -> Self {
+        self.workers = Arc::new(Semaphore::new(worker_limit));
+        self
     }
 }
 
@@ -271,7 +297,8 @@ impl<S> Layer<S> for ConcurrencyLimitLayer {
     fn layer(&self, inner: S) -> Self::Service {
         ConcurrencyLimitService {
             inner,
-            semaphore: self.semaphore.clone(),
+            admission: self.admission.clone(),
+            workers: self.workers.clone(),
         }
     }
 }
@@ -280,7 +307,8 @@ impl<S> Layer<S> for ConcurrencyLimitLayer {
 #[derive(Clone)]
 pub struct ConcurrencyLimitService<S> {
     inner: S,
-    semaphore: Arc<Semaphore>,
+    admission: Arc<Semaphore>,
+    workers: Arc<Semaphore>,
 }
 
 impl<S> Service<Request<BoxBody>> for ConcurrencyLimitService<S>
@@ -298,11 +326,12 @@ where
     }
 
     fn call(&mut self, req: Request<BoxBody>) -> Self::Future {
-        // Acquire a permit immediately and do NOT queue: when the global
-        // in-flight budget is exhausted, reject with RESOURCE_EXHAUSTED (code
-        // 8) so the caller retries elsewhere instead of the request piling up
-        // in memory (the cause of the prod OOM restarts).
-        let permit = match self.semaphore.clone().try_acquire_owned() {
+        // Level 1 (admission): acquire a slot in the bounded in-flight queue
+        // immediately and do NOT queue past it. When the admission budget is
+        // exhausted, reject with RESOURCE_EXHAUSTED (code 8) so the caller
+        // retries elsewhere instead of the request piling up in memory (the
+        // cause of the prod OOM restarts).
+        let admission = match self.admission.clone().try_acquire_owned() {
             Ok(permit) => permit,
             Err(_) => {
                 return Box::pin(async move {
@@ -314,11 +343,20 @@ where
             }
         };
 
+        // Level 2 (workers): wait for a free worker slot. Requests past the
+        // worker cap wait inside the admission queue (backpressure) — they are
+        // not dropped and not merged into the moses subprocess. When
+        // `workers == admission` this never blocks (historical behaviour).
+        let workers = self.workers.clone();
+
         let mut inner = self.inner.clone();
         Box::pin(async move {
             // Held for the duration of the handler future; released on drop
             // (including when the handler future is cancelled mid-flight).
-            let _permit = permit;
+            let _admission = admission;
+            let _worker = workers.acquire().await.map_err(|_| -> BoxError {
+                tonic::Status::internal("concurrency pool closed").into()
+            })?;
             inner.call(req).await.map_err(Into::into)
         })
     }
@@ -661,7 +699,7 @@ mod tests {
         // Give the first request a chance to acquire the only permit.
         tokio::task::yield_now().await;
 
-        assert_eq!(layer.semaphore.available_permits(), 0);
+        assert_eq!(layer.admission.available_permits(), 0);
 
         let second = svc.call(build_req()).await;
         let err = match second {
@@ -681,7 +719,7 @@ mod tests {
         // cancelled client / dropped future should release the permit).
         drop(first);
         tokio::task::yield_now().await;
-        assert_eq!(layer.semaphore.available_permits(), 1);
+        assert_eq!(layer.admission.available_permits(), 1);
     }
 
     #[tokio::test]
@@ -703,7 +741,63 @@ mod tests {
         assert_eq!(r1.status(), http::StatusCode::OK);
         assert_eq!(r2.status(), http::StatusCode::OK);
         // Permits released after completion.
-        assert_eq!(layer.semaphore.available_permits(), 2);
+        assert_eq!(layer.admission.available_permits(), 2);
+    }
+
+    #[tokio::test]
+    async fn worker_cap_limits_parallel_processing_not_admission() {
+        // Level 2 (max_workers): admission is 2 (grpc_queue_size-style budget),
+        // but only 1 worker processes at a time. The first request holds the
+        // sole worker slot (BlockingService never completes), so the second
+        // request must WAIT on the worker permit inside the bounded admission
+        // queue — not be rejected with RESOURCE_EXHAUSTED. This is the key
+        // difference vs `new()` where workers==admission and over-budget is
+        // rejected immediately.
+        let layer = ConcurrencyLimitLayer::new(2).with_workers(1);
+        let mut svc = layer.layer(BlockingService);
+
+        let build_req = || {
+            HttpRequest::builder()
+                .method(Method::POST)
+                .uri(Uri::from_static("/doaid.users.v1.UsersService/CreateUser"))
+                .body(empty_body())
+                .unwrap()
+        };
+
+        // First request is spawned so its future is actually polled: it must
+        // acquire the sole worker permit and then block on the inner (pending)
+        // service. The admission permit is taken synchronously in `call()`.
+        let first = tokio::spawn(svc.call(build_req()));
+        // Drive until the worker permit is consumed.
+        for _ in 0..50 {
+            tokio::task::yield_now().await;
+            if layer.workers.available_permits() == 0 {
+                break;
+            }
+        }
+        assert_eq!(layer.workers.available_permits(), 0);
+        assert_eq!(layer.admission.available_permits(), 1);
+
+        // Second request: it is within the admission budget (2), so it must
+        // NOT be rejected — it spawns, takes the remaining admission permit and
+        // WAITS on the worker slot (backpressure).
+        let second = tokio::spawn(svc.call(build_req()));
+        for _ in 0..50 {
+            tokio::task::yield_now().await;
+            if layer.admission.available_permits() == 0 {
+                break;
+            }
+        }
+        // Both requests are admitted; only one worker slot is held by the first.
+        assert_eq!(layer.admission.available_permits(), 0);
+        assert_eq!(layer.workers.available_permits(), 0);
+
+        // Cleanup: abort both spawned tasks; permits must be released on drop.
+        first.abort();
+        second.abort();
+        tokio::task::yield_now().await;
+        assert_eq!(layer.workers.available_permits(), 1);
+        assert_eq!(layer.admission.available_permits(), 2);
     }
 
     #[tokio::test]
