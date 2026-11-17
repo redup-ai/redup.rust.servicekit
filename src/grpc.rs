@@ -12,13 +12,19 @@
 //! it wraps the service and maps HTTP requests to gRPC service/method names.
 
 use crate::monitor::ServiceKit;
+use axum::body::Bytes;
 use http::{Request, Response};
 use http_body::Body as HttpBody;
+use http_body::{Frame, SizeHint};
+use http_body_util::BodyExt;
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::task::{Context, Poll};
+use tokio::sync::Semaphore;
 use tonic::body::BoxBody;
+use tonic::Status;
 use tower::{Layer, Service};
 
 /// Tonic layer that records metrics around each gRPC request.
@@ -91,6 +97,7 @@ impl<S> Service<Request<BoxBody>> for GrpcMetricsService<S>
 where
     S: Service<Request<BoxBody>, Response = Response<BoxBody>> + Clone + Send + 'static,
     S::Future: Send + 'static,
+    S::Error: 'static + std::fmt::Debug,
 {
     type Response = Response<BoxBody>;
     type Error = S::Error;
@@ -103,7 +110,29 @@ where
     fn call(&mut self, req: Request<BoxBody>) -> Self::Future {
         let method = grpc_method_name(req.uri().path());
         let kit = self.kit.clone();
-        let request_size = req.body().size_hint().exact().unwrap_or(0) as f64;
+
+        // gRPC request/response bodies are streamed lazily, so
+        // `size_hint().exact()` is always `None` — which made
+        // `request_size`/`response_size` observe `0` to the histograms.
+        // Instead, wrap each body in a counter that records the real wire
+        // byte size as its frames are polled, and observe the metric in the
+        // body's `on_end` hook, which fires exactly once once the stream is
+        // fully drained (request: consumed by the handler; response: written
+        // over the wire). This yields real, non-zero sizes.
+        let request_metric = kit.clone();
+        let request_method = method.clone();
+        let (req_parts, req_body) = req.into_parts();
+        let req_body = CountingBody::new(
+            req_body,
+            Some(Box::new(move |bytes: usize| {
+                request_metric.observe_stat(
+                    &format!("request_size___method__{request_method}"),
+                    bytes as f64,
+                );
+            })),
+        )
+        .boxed_unsync();
+        let req = Request::from_parts(req_parts, req_body);
         let mut inner = self.inner.clone();
 
         let start = std::time::Instant::now();
@@ -118,14 +147,67 @@ where
 
             match result {
                 Ok(response) => {
-                    let response_size = response.body().size_hint().exact().unwrap_or(0) as f64;
+                    // tonic turns a handler `Err(Status)` into an
+                    // `Ok(http::Response)` whose headers carry the real
+                    // `grpc-status` (non-zero) — the generated service has
+                    // `Error = Infallible`, so a backend failure never
+                    // reaches this layer as `Err`. Without this check a
+                    // failed request is recorded as a success and never
+                    // lands in `stats_errors` / `processed___status__failure`.
+                    let grpc_code = response
+                        .headers()
+                        .get(Status::GRPC_STATUS)
+                        .and_then(|v| v.to_str().ok())
+                        .and_then(|v| v.parse::<i32>().ok());
+                    let is_error = grpc_code.map(|c| c != 0).unwrap_or(false);
+
+                    let response_metric = kit.clone();
+                    let response_method = method.clone();
+                    let (resp_parts, resp_body) = response.into_parts();
+                    let resp_body = CountingBody::new(
+                        resp_body,
+                        Some(Box::new(move |bytes: usize| {
+                            response_metric.observe_stat(
+                                &format!("response_size___method__{response_method}"),
+                                bytes as f64,
+                            );
+                        })),
+                    )
+                    .boxed_unsync();
+                    let response = Response::from_parts(resp_parts, resp_body);
+
+                    if is_error {
+                        kit.inc_stat(
+                            &format!("processed___method__{method}___status__failure"),
+                            1.0,
+                        );
+                        // Classify into `stats_errors{type}` from the backend
+                        // message (Python `ErrorParser.parse`): the configured
+                        // "service_errors" words (textprocessor/translation/...)
+                        // in the grpc-message decide the label, defaulting to
+                        // "other". This lets a backend failure surface as its
+                        // own error type instead of always collapsing into
+                        // `type="other"`.
+                        let error_message = response
+                            .headers()
+                            .get(Status::GRPC_MESSAGE)
+                            .and_then(|v| v.to_str().ok())
+                            .unwrap_or("");
+                        let error_type = kit.classify_error(error_message);
+                        kit.inc_stat(
+                            &format!("errors___method__{method}___type__{error_type}"),
+                            1.0,
+                        );
+                        kit.observe_stat(&format!("time full___method__{method}"), elapsed);
+                        kit.set_task_status(crate::monitor::TaskStatus::OtherException, &method);
+                        return Ok(response);
+                    }
+
                     kit.inc_stat(
                         &format!("processed___method__{method}___status__success"),
                         1.0,
                     );
                     kit.observe_stat(&format!("time full___method__{method}"), elapsed);
-                    kit.observe_stat(&format!("request_size___method__{method}"), request_size);
-                    kit.observe_stat(&format!("response_size___method__{method}"), response_size);
                     kit.set_task_status(crate::monitor::TaskStatus::Ok, &method);
                     Ok(response)
                 }
@@ -134,19 +216,239 @@ where
                         &format!("processed___method__{method}___status__failure"),
                         1.0,
                     );
-                    let error_type = "other";
+                    // Same classification as the grpc-status branch: pick the
+                    // configured error type from the error text, default `other`.
+                    let error_type = kit.classify_error(&format!("{error:?}"));
                     kit.inc_stat(
                         &format!("errors___method__{method}___type__{error_type}"),
                         1.0,
                     );
                     kit.observe_stat(&format!("time full___method__{method}"), elapsed);
-                    kit.observe_stat(&format!("request_size___method__{method}"), request_size);
                     kit.set_task_status(crate::monitor::TaskStatus::OtherException, &method);
                     Err(error)
                 }
             }
         };
         Box::pin(future)
+    }
+}
+
+/// Boxed error type accepted by tonic's `Server::layer` stack
+/// (`tonic::transport::Error` / `crate::Error` is `Box<dyn Error + Send + Sync>`).
+type BoxError = Box<dyn std::error::Error + Send + Sync + 'static>;
+
+/// Tonic layer implementing the 3-level concurrency model of `redup.python.servicekit`:
+///
+/// 1. **admission** (`grpc_queue_size`) — how many requests the pod admits into
+///    the bounded queue at all. Once the budget is exhausted, a new request is
+///    rejected immediately with gRPC `RESOURCE_EXHAUSTED` (code 8) — not buffered
+///    in memory (the prod OOM fix). This mirrors
+///    `grpc.aio.server(maximum_concurrent_rpcs = grpc_queue_size)`.
+/// 2. **workers** (`max_workers`) — how many admitted requests are actually
+///    processed in parallel at once. Requests beyond this wait inside the bounded
+///    admission queue for a free worker slot (backpressure), they are not dropped
+///    and not merged into the moses process. This is what keeps the per-pair moses
+///    subprocess from being hammered by the whole admission budget at once.
+///
+/// `hpa_max_workers` is NOT part of this layer: it stays a metrics-only
+/// normalisation constant (`service_threads` in `monitor.rs`) that the HPA
+/// PodMetric query uses as its scale target.
+///
+/// All methods share the same pair of semaphores (mirroring the Python pool).
+/// Tonic wraps the whole user layer stack with `RecoverError`, which converts
+/// any `Err(Status)` returned here into a real `grpc-status` trailer — so the
+/// rejection reaches the client as code 8 on the wire.
+///
+/// By default `workers == admission` (i.e. every admitted request processes
+/// immediately), which keeps the historical behaviour for callers that do not
+/// opt into the `max_workers` cap with [`with_workers`](Self::with_workers).
+#[derive(Clone)]
+pub struct ConcurrencyLimitLayer {
+    /// Level 1: admission/size of the bounded in-flight queue (`grpc_queue_size`).
+    admission: Arc<Semaphore>,
+    /// Level 2: number of requests actually processed in parallel (`max_workers`).
+    workers: Arc<Semaphore>,
+}
+
+impl ConcurrencyLimitLayer {
+    /// `limit` is the maximum number of requests admitted into the bounded
+    /// in-flight queue across the entire server (Python `grpc_queue_size`).
+    pub fn new(limit: usize) -> Self {
+        Self {
+            admission: Arc::new(Semaphore::new(limit)),
+            // Default: no worker cap -> every admitted request is processed at
+            // once (historical behaviour).
+            workers: Arc::new(Semaphore::new(limit)),
+        }
+    }
+
+    /// Cap the number of requests processed in parallel to `worker_limit`
+    /// (Python `max_workers`). Requests beyond the cap wait for a free worker
+    /// slot inside the bounded admission queue instead of being rejected.
+    pub fn with_workers(mut self, worker_limit: usize) -> Self {
+        self.workers = Arc::new(Semaphore::new(worker_limit));
+        self
+    }
+}
+
+impl<S> Layer<S> for ConcurrencyLimitLayer {
+    type Service = ConcurrencyLimitService<S>;
+
+    fn layer(&self, inner: S) -> Self::Service {
+        ConcurrencyLimitService {
+            inner,
+            admission: self.admission.clone(),
+            workers: self.workers.clone(),
+        }
+    }
+}
+
+/// Service wrapper produced by [`ConcurrencyLimitLayer`].
+#[derive(Clone)]
+pub struct ConcurrencyLimitService<S> {
+    inner: S,
+    admission: Arc<Semaphore>,
+    workers: Arc<Semaphore>,
+}
+
+impl<S> Service<Request<BoxBody>> for ConcurrencyLimitService<S>
+where
+    S: Service<Request<BoxBody>, Response = Response<BoxBody>> + Clone + Send + 'static,
+    S::Future: Send + 'static,
+    S::Error: Into<BoxError>,
+{
+    type Response = Response<BoxBody>;
+    type Error = BoxError;
+    type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(cx).map_err(Into::into)
+    }
+
+    fn call(&mut self, req: Request<BoxBody>) -> Self::Future {
+        // Level 1 (admission): acquire a slot in the bounded in-flight queue
+        // immediately and do NOT queue past it. When the admission budget is
+        // exhausted, reject with RESOURCE_EXHAUSTED (code 8) so the caller
+        // retries elsewhere instead of the request piling up in memory (the
+        // cause of the prod OOM restarts).
+        let admission = match self.admission.clone().try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(_) => {
+                return Box::pin(async move {
+                    Err(
+                        Status::resource_exhausted("service is overloaded, please retry later")
+                            .into(),
+                    )
+                });
+            }
+        };
+
+        // Level 2 (workers): wait for a free worker slot. Requests past the
+        // worker cap wait inside the admission queue (backpressure) — they are
+        // not dropped and not merged into the moses subprocess. When
+        // `workers == admission` this never blocks (historical behaviour).
+        let workers = self.workers.clone();
+
+        let mut inner = self.inner.clone();
+        Box::pin(async move {
+            // Held for the duration of the handler future; released on drop
+            // (including when the handler future is cancelled mid-flight).
+            let _admission = admission;
+            let _worker = workers.acquire().await.map_err(|_| -> BoxError {
+                tonic::Status::internal("concurrency pool closed").into()
+            })?;
+            inner.call(req).await.map_err(Into::into)
+        })
+    }
+}
+
+/// Wraps a body and counts the bytes of every DATA frame it yields,
+/// invoking `on_end` with the accumulated total exactly once, when the
+/// stream is fully drained. Used for both requests and responses in the
+/// gRPC case, where `size_hint().exact()` is `None`.
+struct CountingBody {
+    inner: BoxBody,
+    counter: Arc<ByteCounter>,
+    on_end: Option<Box<dyn FnOnce(usize) + Send>>,
+}
+
+impl CountingBody {
+    fn new(inner: BoxBody, on_end: Option<Box<dyn FnOnce(usize) + Send>>) -> Self {
+        Self {
+            inner,
+            counter: Arc::new(ByteCounter::new()),
+            on_end,
+        }
+    }
+}
+
+impl HttpBody for CountingBody {
+    type Data = Bytes;
+    type Error = tonic::Status;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        let this = self.as_mut().get_mut();
+        match Pin::new(&mut this.inner).poll_frame(cx) {
+            // Count the actual bytes of each DATA frame.
+            Poll::Ready(Some(Ok(frame))) => {
+                if let Some(data) = frame.data_ref() {
+                    this.counter.add(data.len());
+                }
+                // gRPC over HTTP/2 marks the end of a response with a
+                // trailers frame; hyper may stop polling after trailers, so a
+                // later `Poll::Ready(None)` may never reach us. Fire the size
+                // metric here, on the trailers frame, to guarantee it is
+                // emitted exactly once. `on_end` is take()'n, so a subsequent
+                // terminal poll is a no-op.
+                if frame.is_trailers() {
+                    if let Some(cb) = this.on_end.take() {
+                        cb(this.counter.load(Ordering::Relaxed));
+                    }
+                }
+                Poll::Ready(Some(Ok(frame)))
+            }
+            Poll::Ready(Some(Err(e))) => Poll::Ready(Some(Err(e))),
+            // End of stream: fire the size metric if not already emitted.
+            Poll::Ready(None) => {
+                if let Some(cb) = this.on_end.take() {
+                    cb(this.counter.load(Ordering::Relaxed));
+                }
+                Poll::Ready(None)
+            }
+            Poll::Pending => Poll::Pending,
+        }
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        self.inner.size_hint()
+    }
+}
+
+/// Shared accumulator for a [`CountingBody`].
+struct ByteCounter {
+    bytes: AtomicUsize,
+}
+
+impl ByteCounter {
+    fn new() -> Self {
+        Self {
+            bytes: AtomicUsize::new(0),
+        }
+    }
+
+    fn add(&self, n: usize) {
+        self.bytes.fetch_add(n, Ordering::Relaxed);
+    }
+
+    fn load(&self, o: Ordering) -> usize {
+        self.bytes.load(o)
     }
 }
 
@@ -307,7 +609,360 @@ mod tests {
         assert_eq!(kit.task_tracker().in_flight(), 0);
     }
 
+#[tokio::test]
+    async fn request_response_size_are_non_zero() {
+        // Regression: gRPC bodies are streamed lazily, so `size_hint()` is
+        // `None` and `request_size`/`response_size` used to observe `0`.
+        // The CountingBody wraps the bodies and records the real bytes as the
+        // frames are polled, so the histograms must end up with a sum > 0.
+        let kit = ServiceKit::new(MonitorServerConfig::default(), 4, Some(2));
+        let mut svc = GrpcMetricsLayer::new(kit.clone()).layer(EchoService);
+
+        // Non-empty request body (must be drained by the handler to count).
+        let body = tonic::body::boxed(
+            http_body_util::Full::new(axum::body::Bytes::from_static(b"hello gRPC world"))
+                .map_err(|e| e),
+        );
+        let request = HttpRequest::builder()
+            .method(Method::POST)
+            .uri(Uri::from_static("/doaid.users.v1.UsersService/CreateUser"))
+            .body(body)
+            .unwrap();
+        let resp = svc.call(request).await.unwrap();
+
+        // Drain the response body so the CountingBody sees the end-of-stream
+        // and fires its `on_end` observation once.
+        let mut m = std::pin::pin!(resp.into_body());
+        while std::future::poll_fn(|cx| m.as_mut().poll_frame(cx))
+            .await
+            .is_some()
+        {}
+
+        let text = String::from_utf8_lossy(&kit.metrics_text()).to_string();
+        // request_size was counted when the (empty) handler drained — full
+        // body was buffered by tonic decode, so it should be counted.
+        let req_line = text
+            .lines()
+            .find(|l| {
+                l.starts_with("stats_hist_request_size_sum") && l.contains("method=\"CreateUser\"")
+            })
+            .expect("request_size_sum");
+        let req_sum = req_line
+            .rsplit(' ')
+            .next()
+            .unwrap()
+            .trim()
+            .parse::<f64>()
+            .unwrap();
+        assert!(
+            req_sum > 0.0,
+            "request_size_sum must be > 0, got: {req_line}"
+        );
+
+        let resp_line = text
+            .lines()
+            .find(|l| {
+                l.starts_with("stats_hist_response_size_sum") && l.contains("method=\"CreateUser\"")
+            })
+            .expect("response_size_sum");
+        let resp_sum = resp_line
+            .rsplit(' ')
+            .next()
+            .unwrap()
+            .trim()
+            .parse::<f64>()
+            .unwrap();
+        assert!(
+            resp_sum > 0.0,
+            "response_size_sum must be > 0, got: {resp_line}"
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrency_limit_rejects_when_budget_exhausted() {
+        // Global in-flight budget of 1 across the whole server. The first
+        // request acquires the only permit and blocks, so the second
+        // concurrent request must be rejected with gRPC RESOURCE_EXHAUSTED
+        // (code 8) — not queued/buffered.
+        let layer = ConcurrencyLimitLayer::new(1);
+        let mut svc = layer.layer(BlockingService);
+
+        let build_req = || {
+            HttpRequest::builder()
+                .method(Method::POST)
+                .uri(Uri::from_static("/doaid.users.v1.UsersService/CreateUser"))
+                .body(empty_body())
+                .unwrap()
+        };
+
+        let first = svc.call(build_req());
+        // Give the first request a chance to acquire the only permit.
+        tokio::task::yield_now().await;
+
+        assert_eq!(layer.admission.available_permits(), 0);
+
+        let second = svc.call(build_req()).await;
+        let err = match second {
+            Ok(_) => panic!("second request must be rejected when budget exhausted"),
+            Err(e) => e,
+        };
+        let err = err
+            .downcast::<tonic::Status>()
+            .expect("rejection must be a tonic::Status");
+        assert_eq!(
+            err.code(),
+            tonic::Code::ResourceExhausted,
+            "expected RESOURCE_EXHAUSTED (8), got: {err}"
+        );
+
+        // The blocking first request still holds the permit; drop it (a
+        // cancelled client / dropped future should release the permit).
+        drop(first);
+        tokio::task::yield_now().await;
+        assert_eq!(layer.admission.available_permits(), 1);
+    }
+
+    #[tokio::test]
+    async fn concurrency_limit_allows_within_budget() {
+        let layer = ConcurrencyLimitLayer::new(2);
+        let mut svc = layer.layer(EchoService);
+
+        let build_req = || {
+            HttpRequest::builder()
+                .method(Method::POST)
+                .uri(Uri::from_static("/doaid.users.v1.UsersService/CreateUser"))
+                .body(empty_body())
+                .unwrap()
+        };
+
+        // Two requests within the budget of 2 both succeed.
+        let r1 = svc.call(build_req()).await.expect("first request");
+        let r2 = svc.call(build_req()).await.expect("second request");
+        assert_eq!(r1.status(), http::StatusCode::OK);
+        assert_eq!(r2.status(), http::StatusCode::OK);
+        // Permits released after completion.
+        assert_eq!(layer.admission.available_permits(), 2);
+    }
+
+    #[tokio::test]
+    async fn worker_cap_limits_parallel_processing_not_admission() {
+        // Level 2 (max_workers): admission is 2 (grpc_queue_size-style budget),
+        // but only 1 worker processes at a time. The first request holds the
+        // sole worker slot (BlockingService never completes), so the second
+        // request must WAIT on the worker permit inside the bounded admission
+        // queue — not be rejected with RESOURCE_EXHAUSTED. This is the key
+        // difference vs `new()` where workers==admission and over-budget is
+        // rejected immediately.
+        let layer = ConcurrencyLimitLayer::new(2).with_workers(1);
+        let mut svc = layer.layer(BlockingService);
+
+        let build_req = || {
+            HttpRequest::builder()
+                .method(Method::POST)
+                .uri(Uri::from_static("/doaid.users.v1.UsersService/CreateUser"))
+                .body(empty_body())
+                .unwrap()
+        };
+
+        // First request is spawned so its future is actually polled: it must
+        // acquire the sole worker permit and then block on the inner (pending)
+        // service. The admission permit is taken synchronously in `call()`.
+        let first = tokio::spawn(svc.call(build_req()));
+        // Drive until the worker permit is consumed.
+        for _ in 0..50 {
+            tokio::task::yield_now().await;
+            if layer.workers.available_permits() == 0 {
+                break;
+            }
+        }
+        assert_eq!(layer.workers.available_permits(), 0);
+        assert_eq!(layer.admission.available_permits(), 1);
+
+        // Second request: it is within the admission budget (2), so it must
+        // NOT be rejected — it spawns, takes the remaining admission permit and
+        // WAITS on the worker slot (backpressure).
+        let second = tokio::spawn(svc.call(build_req()));
+        for _ in 0..50 {
+            tokio::task::yield_now().await;
+            if layer.admission.available_permits() == 0 {
+                break;
+            }
+        }
+        // Both requests are admitted; only one worker slot is held by the first.
+        assert_eq!(layer.admission.available_permits(), 0);
+        assert_eq!(layer.workers.available_permits(), 0);
+
+        // Cleanup: abort both spawned tasks; permits must be released on drop.
+        first.abort();
+        second.abort();
+        tokio::task::yield_now().await;
+        assert_eq!(layer.workers.available_permits(), 1);
+        assert_eq!(layer.admission.available_permits(), 2);
+    }
+
+    #[tokio::test]
+    async fn grpc_status_in_ok_response_is_counted_as_failure() {
+        // tonic's generated server converts a handler `Err(status)` into an
+        // `Ok(http::Response)` whose *headers* carry `grpc-status` != 0
+        // (the service has `Error = Infallible`, so the metrics layer never
+        // sees it as `Err`). Regression: such a request must be recorded as a
+        // failure and land in `stats_errors`, not counted as a success.
+        let kit = ServiceKit::new(MonitorServerConfig::default(), 4, Some(2));
+        let layer = GrpcMetricsLayer::new(kit.clone());
+        let mut svc = layer.layer(ErrorStatusService { code: 13 });
+
+        let request = HttpRequest::builder()
+            .method(Method::POST)
+            .uri(Uri::from_static("/doaid.users.v1.TextPreparator/Prepare"))
+            .body(empty_body())
+            .unwrap();
+        let _ = svc.call(request).await;
+
+        let text = String::from_utf8_lossy(&kit.metrics_text()).to_string();
+        let metric_value = |metric: &str, label: &str| -> f64 {
+            text.lines()
+                .filter(|l| l.starts_with(metric) && l.contains(label))
+                .find_map(|l| l.rsplit(' ').next())
+                .and_then(|v| v.trim().parse::<f64>().ok())
+                .unwrap_or(0.0)
+        };
+        assert_eq!(
+            metric_value("stats_processed", "status=\"failure\""),
+            1.0,
+            "non-zero grpc-status must be counted as a failure, metric text:\n{text}"
+        );
+        assert_eq!(
+            metric_value("stats_errors", "type=\"other\""),
+            1.0,
+            "non-zero grpc-status must be counted in stats_errors, metric text:\n{text}"
+        );
+        assert_eq!(
+            metric_value("stats_processed", "status=\"success\""),
+            0.0,
+            "non-zero grpc-status must not be counted as a success, metric text:\n{text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn configured_error_type_is_used_instead_of_other() {
+        // Regression for ErrorParser.classify: with `errors` config supplying
+        // `service_errors = ["textprocessor", "translation"]`, a backend failure
+        // whose grpc-message says "textprocessor: ..." must be recorded under
+        // `stats_errors{type="textprocessor"}`, not the hardcoded `"other"`.
+        let mut monitor = crate::config::MonitorServerConfig::default();
+        monitor.errors.insert(
+            "OTHER_EXCEPTION".to_string(),
+            crate::config::ErrorEntry {
+                service_errors: vec!["textprocessor".to_string(), "translation".to_string()],
+                unhealthy: -1,
+            },
+        );
+        let kit = ServiceKit::new(monitor, 4, Some(2));
+        let layer = GrpcMetricsLayer::new(kit.clone());
+
+        // Reuse ErrorStatusService but make it emit a grpc-message carrying a
+        // configured service-error word. We wrap with a lossy passthrough so the
+        // headers-mutating service can set GRPC_MESSAGE too.
+        let mut svc = layer.layer(StatusWithMessageService {
+            code: 13,
+            message: "textprocessor: unexpected ValueError".to_string(),
+        });
+
+        let request = HttpRequest::builder()
+            .method(Method::POST)
+            .uri(Uri::from_static("/doaid.users.v1.TextPreparator/Prepare"))
+            .body(empty_body())
+            .unwrap();
+        let _ = svc.call(request).await;
+
+        let text = String::from_utf8_lossy(&kit.metrics_text()).to_string();
+        let metric_value = |metric: &str, label: &str| -> f64 {
+            text.lines()
+                .filter(|l| l.starts_with(metric) && l.contains(label))
+                .find_map(|l| l.rsplit(' ').next())
+                .and_then(|v| v.trim().parse::<f64>().ok())
+                .unwrap_or(0.0)
+        };
+        assert_eq!(
+            metric_value("stats_errors", "type=\"textprocessor\""),
+            1.0,
+            "configured service-error must be used as the error type, metric text:\n{text}"
+        );
+        assert_eq!(
+            metric_value("stats_errors", "type=\"other\""),
+            0.0,
+            "must not fall back to 'other' when a configured type matches, metric text:\n{text}"
+        );
+        assert_eq!(
+            metric_value("stats_processed", "status=\"failure\""),
+            1.0,
+            "still counted as a failure, metric text:\n{text}"
+        );
+    }
+
     #[derive(Clone)]
+    struct ErrorStatusService {
+        code: i32,
+    }
+
+    impl Service<HttpRequest<BoxBody>> for ErrorStatusService {
+        type Response = HttpResponse<BoxBody>;
+        type Error = tonic::Status;
+        type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+
+        fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn call(&mut self, _req: HttpRequest<BoxBody>) -> Self::Future {
+            let code = self.code;
+            Box::pin(async move {
+                // Mimic tonic `Status::into_http()`: an Ok response whose
+                // immediate headers carry `grpc-status` != 0.
+                let mut response = HttpResponse::new(tonic::body::empty_body());
+                response
+                    .headers_mut()
+                    .insert(Status::GRPC_STATUS, code.to_string().parse().unwrap());
+                Ok(response)
+            })
+        }
+    }
+
+    /// Like `ErrorStatusService`, but also sets `grpc-message` so the metrics
+    /// layer has text to classify into a configured error type.
+    #[derive(Clone)]
+    struct StatusWithMessageService {
+        code: i32,
+        message: String,
+    }
+
+    impl Service<HttpRequest<BoxBody>> for StatusWithMessageService {
+        type Response = HttpResponse<BoxBody>;
+        type Error = tonic::Status;
+        type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+
+        fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn call(&mut self, _req: HttpRequest<BoxBody>) -> Self::Future {
+            let code = self.code;
+            let message = self.message.clone();
+            Box::pin(async move {
+                let mut response = HttpResponse::new(tonic::body::empty_body());
+                response
+                    .headers_mut()
+                    .insert(Status::GRPC_STATUS, code.to_string().parse().unwrap());
+                response.headers_mut().insert(
+                    Status::GRPC_MESSAGE,
+                    tonic::codegen::http::HeaderValue::from_str(&message).unwrap(),
+                );
+                Ok(response)
+            })
+        }
+    }
+
+#[derive(Clone)]
     struct EchoService;
 
     impl Service<HttpRequest<BoxBody>> for EchoService {
@@ -319,9 +974,72 @@ mod tests {
             Poll::Ready(Ok(()))
         }
 
+        fn call(&mut self, req: HttpRequest<BoxBody>) -> Self::Future {
+            Box::pin(async move {
+                // Drain the request body so the metrics CountingBody sees the
+                // end-of-stream and fires its `on_end` observation (tonic does
+                // this in production when it decodes the request message).
+                let mut req_body = std::pin::pin!(req.into_body());
+                while std::future::poll_fn(|cx| req_body.as_mut().poll_frame(cx))
+                    .await
+                    .is_some()
+                {}
+                // Return a non-empty body so the response-size histogram is
+                // counted too (an empty body would correctly give sum 0).
+                // Use `with_trailers` so the body emits a trailers frame like
+                // real gRPC responses do; the metrics CountingBody fires its
+                // `on_end` on the trailers frame, not only on a terminal None.
+                let resp_body =
+                    http_body_util::Full::new(axum::body::Bytes::from_static(b"a gRPC response"))
+                        .map_err(|e| e)
+                        .with_trailers(async {
+                            let mut map = http::HeaderMap::new();
+                            map.insert("grpc-status", "0".parse().unwrap());
+                            Some(Ok(map))
+                        });
+                Ok(HttpResponse::new(tonic::body::boxed(resp_body)))
+            })
+        }
+    }
+
+    /// A service whose request never resolves; the in-flight permit it
+    /// acquired stays held until the future is dropped. Used to hold the
+    /// semaphore budget deterministically so a concurrent request can be
+    /// observed being rejected.
+    #[derive(Clone)]
+    struct BlockingService;
+
+    impl Service<HttpRequest<BoxBody>> for BlockingService {
+        type Response = HttpResponse<BoxBody>;
+        type Error = tonic::Status;
+        type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+
+        fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn call(&mut self, _req: HttpRequest<BoxBody>) -> Self::Future {
+            Box::pin(std::future::pending())
+        }
+    }
+
+    /// A service whose future never resolves; dropping that future simulates
+    /// a client cancel / reset mid-request.
+    #[derive(Clone)]
+    struct NeverService;
+
+    impl Service<HttpRequest<BoxBody>> for NeverService {
+        type Response = HttpResponse<BoxBody>;
+        type Error = tonic::Status;
+        type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+
+        fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
         fn call(&mut self, _req: HttpRequest<BoxBody>) -> Self::Future {
             let _ = _req;
-            Box::pin(async move { Ok(HttpResponse::new(empty_body())) })
+            Box::pin(std::future::pending())
         }
     }
 
