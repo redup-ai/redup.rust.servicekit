@@ -25,11 +25,11 @@ fn tasks_start_finish_metrics() {
     assert_eq!(tracker.in_flight(), 0);
 
     let text = metrics_text(&kit);
-    assert!(text.contains("started_total{inittime="));
-    assert!(text.contains("completed_total{inittime="));
-    assert!(text.contains("stats_tasks_time_spend_total{inittime="));
-    assert!(text.contains("stats_tasks_with_current_time_spend_normalised_total{inittime="));
-    assert!(text.contains("service_threads{inittime="));
+    assert!(text.contains("started_total"));
+    assert!(text.contains("completed_total"));
+    assert!(text.contains("stats_tasks_time_spend_total"));
+    assert!(text.contains("stats_tasks_with_current_time_spend_normalised_total"));
+    assert!(text.contains("service_threads"));
     assert!(text.contains("tasks_time_spent_quantile_bucket"));
 }
 
@@ -39,7 +39,7 @@ fn custom_stats_and_ema() {
     kit.inc_stat("request___method__Foo", 1.0);
     kit.observe_stat("time full___method__Foo", 1.5);
     let text = metrics_text(&kit);
-    assert!(text.contains("stats_request{inittime="));
+    assert!(text.contains("stats_request"));
     assert!(text.contains("method=\"Foo\""));
     assert!(text.contains("stats_aggregation_time_full"));
     assert!(text.contains("stats_aggregation_last_time_full"));
@@ -99,9 +99,9 @@ fn task_status_series() {
 fn metrics_text_refresh_sets_zero_series() {
     let kit = ServiceKit::new(MonitorServerConfig::default(), 4, Some(2));
     let text = metrics_text(&kit);
-    assert!(text.contains("current_tasks_time_spend{inittime="));
-    assert!(text.contains("current_tasks_max_time_spend{inittime="));
-    assert!(text.contains("tasks_count{inittime="));
-    assert!(text.contains("service_threads{inittime="));
-    assert!(text.contains("stats_tasks_with_current_time_spend_total{inittime="));
+    assert!(text.contains("current_tasks_time_spend"));
+    assert!(text.contains("current_tasks_max_time_spend"));
+    assert!(text.contains("tasks_count"));
+    assert!(text.contains("service_threads"));
+    assert!(text.contains("stats_tasks_with_current_time_spend_total"));
 }

@@ -175,7 +175,7 @@ impl Config {
     /// Key matching is exact (as in Python). Comma-separated values become
     /// lists. Only keys already present in the config are overridden.
     pub fn inject_os_envs(&mut self) {
-        for (env_name, env_value) in std::env::vars() {
+        'env: for (env_name, env_value) in std::env::vars() {
             let segments: Vec<&str> = env_name.split("___").collect();
             if segments.len() == 1 {
                 continue;
@@ -223,11 +223,18 @@ impl Config {
             // Apply the resolved path mutably.
             let mut node = &mut self.data;
             for key in &path {
-                let map = as_map_mut(node).expect("resolved path is a mapping");
-                node = map.get_mut(key_str(key)).expect("resolved key exists");
+                let Some(map) = as_map_mut(node) else {
+                    continue 'env;
+                };
+                let Some(next) = map.get_mut(key_str(key)) else {
+                    continue 'env;
+                };
+                node = next;
             }
-            let map = as_map_mut(node).expect("leaf is a mapping");
-            insert_key(map, &leaf_requested, value);
+            let Some(leaf_map) = as_map_mut(node) else {
+                continue 'env;
+            };
+            insert_key(leaf_map, &leaf_requested, value);
         }
     }
 
@@ -291,11 +298,15 @@ impl<T: serde::de::DeserializeOwned> DeserializeOwnedForConfig for T {
 #[derive(Debug, Clone, Deserialize)]
 pub struct ServiceInfoEntry {
     pub info: String,
-    #[serde(deserialize_with = "deserialize_f64")]
+    #[serde(default, deserialize_with = "deserialize_f64")]
     pub value: f64,
 }
 
 /// Deserialize f64 from a number or a numeric string (env overrides are strings).
+///
+/// Non-finite values (`inf`, `-inf`, `nan`, and their numeric-string forms)
+/// are rejected and replaced with `0.0` so a malformed/placeholder config or
+/// env override can never feed `+Inf`/`NaN` into a metric gauges.
 fn deserialize_f64<'de, D>(deserializer: D) -> Result<f64, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -306,13 +317,14 @@ where
         Num(f64),
         Str(String),
     }
-    match NumOrStr::deserialize(deserializer)? {
-        NumOrStr::Num(n) => Ok(n),
+    let value = match NumOrStr::deserialize(deserializer)? {
+        NumOrStr::Num(n) => n,
         NumOrStr::Str(s) => s
             .trim()
             .parse::<f64>()
-            .map_err(|e| serde::de::Error::custom(format!("invalid number: {e}"))),
-    }
+            .map_err(|e| serde::de::Error::custom(format!("invalid number: {e}")))?,
+    };
+    Ok(if value.is_finite() { value } else { 0.0 })
 }
 
 /// Deserialize u16 from a number or a numeric string (env overrides are strings).
@@ -351,14 +363,6 @@ fn default_unhealthy() -> i32 {
 
 fn default_port() -> u16 {
     9999
-}
-
-/// Process start time string, same format as Python
-/// `str(datetime.datetime.now())` (local time, `%Y-%m-%d %H:%M:%S.%f`).
-/// Used as the `inittime` label value for all metrics.
-pub fn now_inittime() -> String {
-    use chrono::Local;
-    Local::now().format("%Y-%m-%d %H:%M:%S%.6f").to_string()
 }
 
 /// `MonitorServer` config section, identical to Python.

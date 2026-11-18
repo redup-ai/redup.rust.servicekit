@@ -5,7 +5,7 @@
 //! the Prometheus registry is refreshed lazily on each `/metrics` request
 //! (`refresh()`), exactly like `refresh_registry_for_metrics()`.
 
-use crate::config::{now_inittime, MonitorServerConfig};
+use crate::config::MonitorServerConfig;
 use crate::metrics::{
     bucket_type_for_key, custom_gauge_values, parse_stat_key, sanitize_metric_name, MetricsRegistry,
 };
@@ -88,23 +88,23 @@ impl StatsStore {
     }
 
     fn inc(&self, key: &str, count: f64) {
-        let mut stats = self.inner.lock().unwrap();
+        let mut stats = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         *stats.counters.entry(key.to_string()).or_insert(0.0) += count;
     }
 
     fn set(&self, key: &str, value: f64) {
-        let mut stats = self.inner.lock().unwrap();
+        let mut stats = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         stats.counters.insert(key.to_string(), value);
     }
 
     /// Insert a stat unless the key already exists (idempotent init).
     fn ensure(&self, key: &str, value: f64) {
-        let mut stats = self.inner.lock().unwrap();
+        let mut stats = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         stats.counters.entry(key.to_string()).or_insert(value);
     }
 
     fn observe(&self, key: &str, value: f64) {
-        let mut stats = self.inner.lock().unwrap();
+        let mut stats = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         // Split borrows: take maps out to avoid double mutable borrow.
         let mut ema_long = std::mem::take(&mut stats.ema_long);
         let mut ema_short = std::mem::take(&mut stats.ema_short);
@@ -114,12 +114,12 @@ impl StatsStore {
     }
 
     fn add_task(&self, id: String, start: Instant) {
-        let mut stats = self.inner.lock().unwrap();
+        let mut stats = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         stats.tasks.insert(id, start);
     }
 
     fn remove_task(&self, id: &str) -> Option<Duration> {
-        let mut stats = self.inner.lock().unwrap();
+        let mut stats = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let start = stats.tasks.remove(id)?;
         Some(start.elapsed())
     }
@@ -160,19 +160,38 @@ impl TaskTracker {
             &[],
             crate::metrics::BucketType::Time,
         );
-        hist.with_label_values(&[self.registry.inittime()])
-            .observe(duration.as_secs_f64());
+        hist.with_label_values(&[]).observe(duration.as_secs_f64());
         Some(duration)
     }
 
-    /// Remove a task without metrics (e.g. on cancellation).
+    /// Remove a task (e.g. on cancellation / client abort) and charge its
+    /// accumulated elapsed time to the lifetime `stats_tasks_time_spend_total`
+    /// counter.
+    ///
+    /// This keeps `current_tasks_time_spend + stats_tasks_time_spend_total`
+    /// monotonic: every task that leaves `tasks` — whether by completing via
+    /// [`finish`](Self::finish) or by being cancelled via `discard` — must
+    /// contribute its elapsed time to `spent`. Otherwise `sum + spent` (and the
+    /// derived `normalised` gauge) would drop, breaking the `_total` contract
+    /// and producing bogus `rate()` spikes.
     pub fn discard(&self, id: &str) {
-        self.store.remove_task(id);
+        if let Some(duration) = self.store.remove_task(id) {
+            self.registry.inc_counter(
+                "stats_tasks_time_spend_total",
+                "Total time spent on completed tasks.",
+                duration.as_secs_f64(),
+            );
+        }
     }
 
     /// Number of in-flight tasks.
     pub fn in_flight(&self) -> usize {
-        self.store.inner.lock().unwrap().tasks.len()
+        self.store
+            .inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .tasks
+            .len()
     }
 }
 
@@ -218,7 +237,7 @@ impl ServiceKit {
         max_workers: u32,
         hpa_max_workers: Option<u32>,
     ) -> Arc<Self> {
-        let registry = MetricsRegistry::new(now_inittime());
+        let registry = MetricsRegistry::new();
         let store = Arc::new(StatsStore::new());
         let service_threads = hpa_max_workers.unwrap_or(max_workers);
         let error_types = collect_error_types(&monitor);
@@ -285,28 +304,27 @@ impl ServiceKit {
             crate::metrics::BucketType::Time,
         );
         // Initial zero values (Python `.labels(...).inc(0)` / `.set(...)`).
-        let inittime = r.inittime();
         r.gauge_vec("tasks_count", "", &[])
-            .with_label_values(&[inittime])
+            .with_label_values(&[])
             .set(0.0);
         r.gauge_vec("current_tasks_time_spend", "", &[])
-            .with_label_values(&[inittime])
+            .with_label_values(&[])
             .set(0.0);
         r.gauge_vec("current_tasks_max_time_spend", "", &[])
-            .with_label_values(&[inittime])
+            .with_label_values(&[])
             .set(0.0);
         r.gauge_vec("stats_tasks_with_current_time_spend_total", "", &[])
-            .with_label_values(&[inittime])
+            .with_label_values(&[])
             .set(0.0);
         r.gauge_vec(
             "stats_tasks_with_current_time_spend_normalised_total",
             "",
             &[],
         )
-        .with_label_values(&[inittime])
+        .with_label_values(&[])
         .set(0.0);
         r.gauge_vec("service_threads", "", &[])
-            .with_label_values(&[inittime])
+            .with_label_values(&[])
             .set(self.service_threads as f64);
         // Service info gauges (Python adds `service_threads` itself).
         for (key, entry) in self
@@ -315,15 +333,10 @@ impl ServiceKit {
         {
             let name = sanitize_metric_name(&key);
             r.gauge_vec(&name, &entry.info, &[])
-                .with_label_values(&[inittime])
+                .with_label_values(&[])
                 .set(entry.value);
         }
         // Pre-create per-method stats are done by services via `init_method`.
-    }
-
-    /// Current `inittime` value.
-    pub fn inittime(&self) -> &str {
-        self.registry.inittime()
     }
 
     /// Metrics registry (export access).
@@ -333,14 +346,14 @@ impl ServiceKit {
 
     /// Configure the readiness probe used by `/readyz`.
     pub fn set_ready_probe(&self, probe: Arc<dyn ReadyProbe>) {
-        *self.ready_probe.lock().unwrap() = Some(probe);
+        *self.ready_probe.lock().unwrap_or_else(|e| e.into_inner()) = Some(probe);
     }
 
     /// Current ready state (default false).
     pub fn is_ready(&self) -> bool {
         self.ready_probe
             .lock()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .as_ref()
             .map(|p| p.is_ready())
             .unwrap_or(false)
@@ -410,11 +423,11 @@ impl ServiceKit {
         self.store.observe(key, value);
         if let Some(bucket_type) = bucket_type_for_key(key) {
             let (metric_name, labels) = parse_stat_key(key);
-            let hist_name = format!("stats_hist_{}", sanitize_metric_name(&metric_name));
+            let hist_name = format!("stats_hist_{metric_name}");
             let hist = self
                 .registry
                 .custom_histogram(&hist_name, &labels, bucket_type);
-            let values = custom_gauge_values(self.registry.inittime(), &labels);
+            let values = custom_gauge_values(&labels);
             let value_refs: Vec<&str> = values.iter().map(|s| s.as_str()).collect();
             hist.with_label_values(&value_refs).observe(value);
         }
@@ -427,7 +440,7 @@ impl ServiceKit {
 
     /// Set a task status for health series (Python `set_task_status`).
     pub fn set_task_status(&self, status: TaskStatus, task_type: &str) {
-        let mut stats = self.store.inner.lock().unwrap();
+        let mut stats = self.store.inner.lock().unwrap_or_else(|e| e.into_inner());
         let (old_status, old_series) = stats
             .statuses
             .get(task_type)
@@ -448,41 +461,41 @@ impl ServiceKit {
     }
 
     /// Refresh the Prometheus registry from current stats (called on `/metrics`).
+    ///
+    /// Iterates the live stats maps under the store lock to avoid cloning
+    /// `counters`/`ema_*`/`tasks` on every scrape (which caused a memory/CPU
+    /// spike proportional to the number of series). The registry writes take
+    /// their own locks in `MetricsRegistry`, so holding `store.inner` here does
+    /// not deadlock.
     pub fn refresh(&self) {
-        let snapshot = {
-            let stats = self.store.inner.lock().unwrap();
-            (
-                stats.ema_long.clone(),
-                stats.ema_short.clone(),
-                stats.counters.clone(),
-                stats.tasks.clone(),
-            )
-        };
-        let (ema_long, ema_short, counters, tasks) = snapshot;
         let now = Instant::now();
+        let stats = self.store.inner.lock().unwrap_or_else(|e| e.into_inner());
 
         // EMA long/short -> stats_aggregation_<key> / stats_aggregation_last_<key>.
-        for (key, value) in &ema_long {
+        for (key, value) in &stats.ema_long {
             self.set_custom_stat(&format!("stats_aggregation_{key}"), *value);
         }
-        for (key, value) in &ema_short {
+        for (key, value) in &stats.ema_short {
             self.set_custom_stat(&format!("stats_aggregation_last_{key}"), *value);
         }
         // Counters -> stats_<key> (gauge on the wire, as in Python).
-        for (key, value) in &counters {
+        for (key, value) in &stats.counters {
             if key.starts_with("series.") {
                 continue;
             }
             self.set_custom_stat(&format!("stats_{key}"), *value);
         }
-        // Task series.
-        let task_durations: Vec<f64> = tasks
-            .values()
-            .map(|t| now.duration_since(*t).as_secs_f64())
-            .collect();
-        let tasks_count = task_durations.len() as f64;
-        let sum: f64 = task_durations.iter().sum();
-        let max: f64 = task_durations.iter().copied().fold(0.0, f64::max);
+        // Task series. `sum` is the total age of in-flight tasks; `max` the
+        // oldest one.
+        let mut tasks_count: f64 = 0.0;
+        let mut sum: f64 = 0.0;
+        let mut max: f64 = 0.0;
+        for t in stats.tasks.values() {
+            let age = now.duration_since(*t).as_secs_f64();
+            tasks_count += 1.0;
+            sum += age;
+            max = max.max(age);
+        }
         self.registry.set_gauge(
             "tasks_count",
             "The total number of tasks currently being processed.",
@@ -531,9 +544,8 @@ impl ServiceKit {
         // full_key may be "stats_request___method__Foo" or
         // "stats_aggregation_time full___method__Foo".
         let (metric_name, labels) = parse_stat_key(full_key);
-        let sanitized = sanitize_metric_name(&metric_name);
-        let vec = self.registry.custom_gauge(&sanitized, &labels);
-        let values = custom_gauge_values(self.registry.inittime(), &labels);
+        let vec = self.registry.custom_gauge(&metric_name, &labels);
+        let values = custom_gauge_values(&labels);
         let value_refs: Vec<&str> = values.iter().map(|s| s.as_str()).collect();
         vec.with_label_values(&value_refs).set(value);
     }
@@ -546,7 +558,7 @@ impl ServiceKit {
 
     /// Current statuses (health series), analog of `get_statuses`.
     pub fn get_statuses(&self) -> Vec<(String, String, u64)> {
-        let stats = self.store.inner.lock().unwrap();
+        let stats = self.store.inner.lock().unwrap_or_else(|e| e.into_inner());
         stats
             .statuses
             .iter()

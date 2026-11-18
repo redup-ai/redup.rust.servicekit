@@ -1,8 +1,7 @@
 # Metrics
 
-All metrics carry the `inittime` label (process start time), `inittime` first
-— exactly like `redup.python.servicekit`. The registry is refreshed lazily on
-each `/metrics` request (`ServiceKit::refresh`).
+The registry is refreshed lazily on each `/metrics` request
+(`ServiceKit::refresh`).
 
 ## Task metrics
 

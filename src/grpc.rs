@@ -410,7 +410,14 @@ impl HttpBody for CountingBody {
                 }
                 Poll::Ready(Some(Ok(frame)))
             }
-            Poll::Ready(Some(Err(e))) => Poll::Ready(Some(Err(e))),
+            Poll::Ready(Some(Err(e))) => {
+                // Fire the size metric on error too, so a client reset /
+                // mid-stream failure still accounts for the partial bytes.
+                if let Some(cb) = this.on_end.take() {
+                    cb(this.counter.load(Ordering::Relaxed));
+                }
+                Poll::Ready(Some(Err(e)))
+            }
             // End of stream: fire the size metric if not already emitted.
             Poll::Ready(None) => {
                 if let Some(cb) = this.on_end.take() {
@@ -1019,26 +1026,6 @@ mod tests {
         }
 
         fn call(&mut self, _req: HttpRequest<BoxBody>) -> Self::Future {
-            Box::pin(std::future::pending())
-        }
-    }
-
-    /// A service whose future never resolves; dropping that future simulates
-    /// a client cancel / reset mid-request.
-    #[derive(Clone)]
-    struct NeverService;
-
-    impl Service<HttpRequest<BoxBody>> for NeverService {
-        type Response = HttpResponse<BoxBody>;
-        type Error = tonic::Status;
-        type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
-
-        fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-            Poll::Ready(Ok(()))
-        }
-
-        fn call(&mut self, _req: HttpRequest<BoxBody>) -> Self::Future {
-            let _ = _req;
             Box::pin(std::future::pending())
         }
     }

@@ -2,8 +2,7 @@
 //!
 //! Metric names, label names, label ordering and histogram buckets are
 //! semantically identical to `redup.python.servicekit`
-//! (`redup_servicekit.metrics` + `MonitorStorage`). All metrics carry the
-//! `inittime` label (process start time string), `inittime` first.
+//! (`redup_servicekit.metrics` + `MonitorStorage`).
 //!
 //! Naming rule: the Python client renders counters with a `_total` suffix
 //! (`started` -> `started_total`), while the Rust `prometheus` crate does not
@@ -112,15 +111,28 @@ pub fn bucket_type_for_key(key: &str) -> Option<BucketType> {
 }
 
 /// Sanitize a metric name the same way as
-/// `MonitorStorage._sanitize_metric_name` (space/dash/dot -> underscore, lowercase).
+/// Sanitize a metric name so it is always a valid Prometheus metric name
+/// (`[a-zA-Z_][a-zA-Z0-9_]*`) — `GaugeVec::new`/`CounterVec::new`/`HistogramVec::new`
+/// panic on an invalid name. `MonitorStorage._sanitize_metric_name` maps
+/// space/dash/dot to underscore; we additionally strip every other invalid
+/// character and guarantee the name does not start with a digit, so a
+/// user-derived key (service info, stat key) can never poison the registry.
 pub fn sanitize_metric_name(name: &str) -> String {
-    name.chars()
-        .map(|c| match c {
-            ' ' | '-' | '.' => '_',
-            _ => c,
-        })
-        .collect::<String>()
-        .to_lowercase()
+    let mut out = String::with_capacity(name.len().max(1));
+    for (i, b) in name.bytes().enumerate() {
+        let ok = if i == 0 {
+            b.is_ascii_alphabetic() || b == b'_'
+        } else {
+            b.is_ascii_alphanumeric() || b == b'_'
+        };
+        out.push(if ok { b as char } else { '_' });
+    }
+    if out.is_empty() {
+        out.push_str("unknown");
+    } else if !(out.as_bytes()[0] == b'_' || out.as_bytes()[0].is_ascii_alphabetic()) {
+        out.insert(0, '_');
+    }
+    out.to_lowercase()
 }
 
 /// Sanitize a Prometheus label name so `GaugeVec::new`/`CounterVec::new` can
@@ -150,65 +162,64 @@ pub fn sanitize_label_name(name: &str) -> String {
 /// The first part is the metric name; the remaining parts are `label__value` pairs.
 pub fn parse_stat_key(key: &str) -> (String, Vec<(String, String)>) {
     let (name, rest) = key.split_once("___").unwrap_or((key, ""));
-    let mut labels = Vec::new();
+    let mut labels: Vec<(String, String)> = Vec::new();
     for label_part in rest.split("___").filter(|s| !s.is_empty()) {
         if let Some((label_name, label_value)) = label_part.split_once("__") {
-            labels.push((sanitize_label_name(label_name), label_value.to_string()));
+            let label_name = sanitize_label_name(label_name);
+            // Duplicate label names (e.g. "a-b" and "a b" both -> "a_b")
+            // make `*Vec::new` panic; keep the first occurrence only so the
+            // label-name/label-value counts stay aligned.
+            if !labels.iter().any(|(n, _)| n == &label_name) {
+                labels.push((label_name, label_value.to_string()));
+            }
         }
     }
     (name.to_string(), labels)
 }
 
-/// Build label names for a metric: `inittime` first, then extra labels.
+/// Build label names for a metric from extra labels.
 pub fn label_names(extra: &[&str]) -> Vec<String> {
-    let mut names = Vec::with_capacity(extra.len() + 1);
-    names.push("inittime".to_string());
-    names.extend(extra.iter().map(|s| sanitize_label_name(s)));
-    names
+    extra.iter().map(|s| sanitize_label_name(s)).collect()
 }
 
-/// Build label values for a metric: `inittime` first, then extra values.
-pub fn label_values(inittime: &str, extra: &[&str]) -> Vec<String> {
-    let mut values = Vec::with_capacity(extra.len() + 1);
-    values.push(inittime.to_string());
-    values.extend(extra.iter().map(|s| s.to_string()));
-    values
+/// Build label values for a metric from extra label values.
+pub fn label_values(extra: &[&str]) -> Vec<String> {
+    extra.iter().map(|s| s.to_string()).collect()
 }
 
 /// Build owned label values for a metric from parsed label pairs.
-pub fn custom_gauge_values(inittime: &str, labels: &[(String, String)]) -> Vec<String> {
-    label_values(
-        inittime,
-        &labels.iter().map(|(_, v)| v.as_str()).collect::<Vec<_>>(),
-    )
+pub fn custom_gauge_values(labels: &[(String, String)]) -> Vec<String> {
+    label_values(&labels.iter().map(|(_, v)| v.as_str()).collect::<Vec<_>>())
 }
 
 /// Prometheus registry with lazily created metrics keyed by metric name.
-/// Every metric is label-vector based and always carries `inittime`.
 #[derive(Clone)]
 pub struct MetricsRegistry {
     registry: Arc<Registry>,
-    inittime: String,
     counter_vecs: Arc<Mutex<HashMap<String, CounterVec>>>,
     gauge_vecs: Arc<Mutex<HashMap<String, GaugeVec>>>,
     histogram_vecs: Arc<Mutex<HashMap<String, HistogramVec>>>,
 }
 
 impl MetricsRegistry {
-    /// Create a registry with the given `inittime` label value.
-    pub fn new(inittime: String) -> Self {
+    /// Create a new registry.
+    pub fn new() -> Self {
         Self {
             registry: Arc::new(Registry::new()),
-            inittime,
             counter_vecs: Arc::new(Mutex::new(HashMap::new())),
             gauge_vecs: Arc::new(Mutex::new(HashMap::new())),
             histogram_vecs: Arc::new(Mutex::new(HashMap::new())),
         }
     }
+}
 
-    pub fn inittime(&self) -> &str {
-        &self.inittime
+impl Default for MetricsRegistry {
+    fn default() -> Self {
+        Self::new()
     }
+}
+
+impl MetricsRegistry {
 
     pub fn registry(&self) -> Arc<Registry> {
         self.registry.clone()
@@ -224,37 +235,49 @@ impl MetricsRegistry {
         buffer
     }
 
-    /// Get or create a `CounterVec` (counter with `inittime` label).
+    /// Get or create a `CounterVec` (counter with the given labels).
     pub fn counter_vec(&self, name: &str, help: &str, extra_labels: &[&str]) -> CounterVec {
+        // Metric names must be unique; cache and register by the *sanitized*
+        // name so a raw name ("time full") and a style variant ("time-full")
+        // that normalize to the same metric cannot double-register and panic.
+        let key = sanitize_metric_name(name);
         let mut cache = self.counter_vecs.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(c) = cache.get(name) {
+        if let Some(c) = cache.get(&key) {
             return c.clone();
         }
-        let opts = Opts::new(name, help);
+        let opts = Opts::new(&key, help);
         let label_names_owned = label_names(extra_labels);
         let label_refs: Vec<&str> = label_names_owned.iter().map(|s| s.as_str()).collect();
         let vec = CounterVec::new(opts, &label_refs).unwrap();
-        self.registry
-            .register(Box::new(vec.clone()))
-            .expect("counter vec already registered");
-        cache.insert(name.to_string(), vec.clone());
+        if let Err(e) = self.registry.register(Box::new(vec.clone())) {
+            if let Some(existing) = cache.get(&key) {
+                return existing.clone();
+            }
+            tracing::error!("failed to register counter {key}: {e}");
+        }
+        cache.insert(key, vec.clone());
         vec
     }
 
-    /// Get or create a `GaugeVec` (gauge with `inittime` label).
+    /// Get or create a `GaugeVec` (gauge with the given labels).
     pub fn gauge_vec(&self, name: &str, help: &str, extra_labels: &[&str]) -> GaugeVec {
+        // Cache and register by the sanitized name (see `counter_vec`).
+        let key = sanitize_metric_name(name);
         let mut cache = self.gauge_vecs.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(g) = cache.get(name) {
+        if let Some(g) = cache.get(&key) {
             return g.clone();
         }
-        let opts = Opts::new(name, help);
+        let opts = Opts::new(&key, help);
         let label_names_owned = label_names(extra_labels);
         let label_refs: Vec<&str> = label_names_owned.iter().map(|s| s.as_str()).collect();
         let vec = GaugeVec::new(opts, &label_refs).unwrap();
-        self.registry
-            .register(Box::new(vec.clone()))
-            .expect("gauge vec already registered");
-        cache.insert(name.to_string(), vec.clone());
+        if let Err(e) = self.registry.register(Box::new(vec.clone())) {
+            if let Some(existing) = cache.get(&key) {
+                return existing.clone();
+            }
+            tracing::error!("failed to register gauge {key}: {e}");
+        }
+        cache.insert(key, vec.clone());
         vec
     }
 
@@ -266,64 +289,65 @@ impl MetricsRegistry {
         extra_labels: &[&str],
         bucket_type: BucketType,
     ) -> HistogramVec {
+        // Cache and register by the sanitized name (see `counter_vec`).
+        let key = sanitize_metric_name(name);
         let mut cache = self
             .histogram_vecs
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        if let Some(h) = cache.get(name) {
+        if let Some(h) = cache.get(&key) {
             return h.clone();
         }
-        let opts = HistogramOpts::new(name, help).buckets(bucket_type.buckets().to_vec());
+        let opts = HistogramOpts::new(&key, help).buckets(bucket_type.buckets().to_vec());
         let label_names_owned = label_names(extra_labels);
         let label_refs: Vec<&str> = label_names_owned.iter().map(|s| s.as_str()).collect();
         let vec = HistogramVec::new(opts, &label_refs).unwrap();
-        self.registry
-            .register(Box::new(vec.clone()))
-            .expect("histogram vec already registered");
-        cache.insert(name.to_string(), vec.clone());
+        if let Err(e) = self.registry.register(Box::new(vec.clone())) {
+            if let Some(existing) = cache.get(&key) {
+                return existing.clone();
+            }
+            tracing::error!("failed to register histogram {key}: {e}");
+        }
+        cache.insert(key, vec.clone());
         vec
     }
 
-    /// Set a gauge value (single `inittime` label).
+    /// Set a gauge value (single label-less series).
     pub fn set_gauge(&self, name: &str, help: &str, value: f64) {
         self.gauge_vec(name, help, &[])
-            .with_label_values(&[self.inittime.as_str()])
+            .with_label_values(&[])
             .set(value);
     }
 
-    /// Increment a counter (single `inittime` label).
+    /// Increment a counter (single label-less series).
     pub fn inc_counter(&self, name: &str, help: &str, value: f64) {
         self.counter_vec(name, help, &[])
-            .with_label_values(&[self.inittime.as_str()])
+            .with_label_values(&[])
             .inc_by(value);
     }
 
-    /// Gauge value getter for the `inittime`-only series (used by refresh).
+    /// Gauge value getter for the label-less series (used by refresh).
     pub fn gauge_value(&self, name: &str) -> Option<f64> {
         let cache = self.gauge_vecs.lock().unwrap_or_else(|e| e.into_inner());
         let vec = cache.get(name)?;
-        Some(vec.with_label_values(&[self.inittime.as_str()]).get())
+        Some(vec.with_label_values(&[]).get())
     }
 
-    /// Counter value getter for the `inittime`-only series (used by refresh).
+    /// Counter value getter for the label-less series (used by refresh).
     pub fn counter_value(&self, name: &str) -> Option<f64> {
         let cache = self.counter_vecs.lock().unwrap_or_else(|e| e.into_inner());
         let vec = cache.get(name)?;
-        Some(vec.with_label_values(&[self.inittime.as_str()]).get())
+        Some(vec.with_label_values(&[]).get())
     }
 
     /// Get a `stats_<key>` gauge, creating it lazily with the parsed labels.
     pub fn custom_gauge(&self, metric_name: &str, labels: &[(String, String)]) -> GaugeVec {
         let extra: Vec<&str> = labels.iter().map(|(n, _)| n.as_str()).collect();
-        let vec = self.gauge_vec(
+        self.gauge_vec(
             metric_name,
             &format!("This is metric `{metric_name}` from ServiceKit."),
             &extra,
-        );
-        let values = custom_gauge_values(&self.inittime, labels);
-        let value_refs: Vec<&str> = values.iter().map(|s| s.as_str()).collect();
-        vec.with_label_values(&value_refs);
-        vec
+        )
     }
 
     /// Get a `stats_hist_<key>` histogram, creating it lazily with parsed labels.
@@ -334,16 +358,12 @@ impl MetricsRegistry {
         bucket_type: BucketType,
     ) -> HistogramVec {
         let extra: Vec<&str> = labels.iter().map(|(n, _)| n.as_str()).collect();
-        let vec = self.histogram_vec(
+        self.histogram_vec(
             metric_name,
             &format!("This is hist metric `{metric_name}` in stats from ServiceKit."),
             &extra,
             bucket_type,
-        );
-        let values = custom_gauge_values(&self.inittime, labels);
-        let value_refs: Vec<&str> = values.iter().map(|s| s.as_str()).collect();
-        vec.with_label_values(&value_refs);
-        vec
+        )
     }
 }
 
@@ -413,6 +433,11 @@ mod tests {
         assert_eq!(sanitize_metric_name("time full"), "time_full");
         assert_eq!(sanitize_metric_name("Request-Size"), "request_size");
         assert_eq!(sanitize_metric_name("a.b.c"), "a_b_c");
+        // Must never panic `GaugeVec::new`/`CounterVec::new` (invalid names).
+        assert_eq!(sanitize_metric_name("123"), "_23");
+        assert_eq!(sanitize_metric_name("a/b:c"), "a_b_c");
+        assert_eq!(sanitize_metric_name("м"), "__");
+        assert_eq!(sanitize_metric_name(""), "unknown");
     }
 
     #[test]
@@ -464,6 +489,16 @@ mod tests {
                 ("status".to_string(), "success".to_string())
             ]
         );
+    }
+
+    #[test]
+    fn parse_stat_key_dedupes_label_names() {
+        // Regression: "a-b" and "a b" both sanitize to "a_b"; duplicates
+        // would make `GaugeVec::new`/`CounterVec::new` panic (duplicate label
+        // name), poisoning the registry. Only the first occurrence is kept.
+        let (name, labels) = parse_stat_key("req___a-b__1___a b__2");
+        assert_eq!(name, "req");
+        assert_eq!(labels, vec![("a_b".to_string(), "1".to_string())]);
     }
 
     #[test]
