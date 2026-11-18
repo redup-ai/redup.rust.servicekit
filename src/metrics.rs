@@ -220,7 +220,6 @@ impl Default for MetricsRegistry {
 }
 
 impl MetricsRegistry {
-
     pub fn registry(&self) -> Arc<Registry> {
         self.registry.clone()
     }

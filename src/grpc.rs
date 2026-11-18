@@ -616,7 +616,7 @@ mod tests {
         assert_eq!(kit.task_tracker().in_flight(), 0);
     }
 
-#[tokio::test]
+    #[tokio::test]
     async fn request_response_size_are_non_zero() {
         // Regression: gRPC bodies are streamed lazily, so `size_hint()` is
         // `None` and `request_size`/`response_size` used to observe `0`.
@@ -969,7 +969,7 @@ mod tests {
         }
     }
 
-#[derive(Clone)]
+    #[derive(Clone)]
     struct EchoService;
 
     impl Service<HttpRequest<BoxBody>> for EchoService {

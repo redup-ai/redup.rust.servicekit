@@ -5,13 +5,7 @@
 //! `/readyz` returns 200 OK when the service is ready (probe), else 503.
 
 use crate::monitor::ServiceKit;
-use axum::{
-    extract::State,
-    http::StatusCode,
-    response::IntoResponse,
-    routing::get,
-    Router,
-};
+use axum::{extract::State, http::StatusCode, response::IntoResponse, routing::get, Router};
 use http::{Request, Response};
 use http_body::Body as HttpBody;
 use std::future::Future;
@@ -231,7 +225,10 @@ where
 /// `id` so an unknown dynamic path still cannot explode the metric series.
 pub fn http_method_name(path: &str) -> String {
     let trimmed = path.trim_end_matches('/');
-    let last = trimmed.rsplit('/').find(|s| !s.is_empty()).unwrap_or("root");
+    let last = trimmed
+        .rsplit('/')
+        .find(|s| !s.is_empty())
+        .unwrap_or("root");
     if is_dynamic_segment(last) {
         "id".to_string()
     } else {
@@ -427,8 +424,14 @@ mod tests {
             // "Cancel" the task while it is still in flight: the guard would
             // drop here, charging the elapsed time to `spent`.
             let text = kit.metrics_text();
-            let sum_after_start = parse_metric(std::str::from_utf8(&text).unwrap(), "current_tasks_time_spend");
-            let spent_after_start = parse_metric(std::str::from_utf8(&text).unwrap(), "stats_tasks_time_spend_total");
+            let sum_after_start = parse_metric(
+                std::str::from_utf8(&text).unwrap(),
+                "current_tasks_time_spend",
+            );
+            let spent_after_start = parse_metric(
+                std::str::from_utf8(&text).unwrap(),
+                "stats_tasks_time_spend_total",
+            );
             (id, sum_after_start, spent_after_start)
         };
         let (id, sum_after_start, spent_after_start) = metrics_after_start;
@@ -438,8 +441,14 @@ mod tests {
         kit.task_tracker().discard(&id);
 
         let text = kit.metrics_text();
-        let sum_after_discard = parse_metric(std::str::from_utf8(&text).unwrap(), "current_tasks_time_spend");
-        let spent_after_discard = parse_metric(std::str::from_utf8(&text).unwrap(), "stats_tasks_time_spend_total");
+        let sum_after_discard = parse_metric(
+            std::str::from_utf8(&text).unwrap(),
+            "current_tasks_time_spend",
+        );
+        let spent_after_discard = parse_metric(
+            std::str::from_utf8(&text).unwrap(),
+            "stats_tasks_time_spend_total",
+        );
 
         // The task left `tasks` (sum dropped) ...
         assert!(
